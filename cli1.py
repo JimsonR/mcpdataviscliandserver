@@ -134,11 +134,40 @@ llm = AzureChatOpenAI(
 )
 
 
+
 from typing import List, Optional
+from uuid import uuid4
+from fastapi import Body
+
+# --- In-memory chat history store for tabbed chat (chat_id) ---
+chat_histories = {}  # {chat_id: [history_dicts]}
 
 class ChatRequest(BaseModel):
     message: str
     history: Optional[List[dict]] = None  # Each dict: {"role": "user"/"assistant", "content": "..."}
+    chat_id: Optional[str] = None  # For tabbed chat
+
+# --- Chat session management endpoints ---
+@app.post("/chat/create-session")
+def create_chat_session():
+    chat_id = str(uuid4())
+    chat_histories[chat_id] = []
+    return {"chat_id": chat_id}
+
+@app.get("/chat/list-sessions")
+def list_chat_sessions():
+    return {"chat_ids": list(chat_histories.keys())}
+
+@app.get("/chat/get-history/{chat_id}")
+def get_chat_history(chat_id: str):
+    return {"chat_id": chat_id, "history": chat_histories.get(chat_id, [])}
+
+@app.delete("/chat/delete-session/{chat_id}")
+def delete_chat_session(chat_id: str):
+    if chat_id in chat_histories:
+        del chat_histories[chat_id]
+        return {"deleted": True, "chat_id": chat_id}
+    return {"deleted": False, "chat_id": chat_id, "error": "Not found"}
 
 @app.post("/mcp/call-tool")
 async def call_mcp_tool(server: str, tool_name: str, arguments: dict):
@@ -206,12 +235,22 @@ async def get_prompt_content(server: str, prompt_name: str, arguments: dict = {}
 
 from langchain_core.messages import AIMessage
 
+
+# --- Updated /llm/chat endpoint to support tabbed chat (chat_id) ---
 @app.post("/llm/chat")
 async def llm_chat(req: ChatRequest):
+    # Use chat_id to manage history if provided
+    history = req.history
+    if req.chat_id:
+        # Use stored history if available, else initialize
+        if req.chat_id not in chat_histories:
+            chat_histories[req.chat_id] = []
+        if history is None:
+            history = chat_histories[req.chat_id]
     # Build message list: history + new message
     messages = []
-    if req.history:
-        for m in req.history:
+    if history:
+        for m in history:
             if m["role"] == "user":
                 messages.append(HumanMessage(content=m["content"]))
             elif m["role"] == "assistant":
@@ -219,7 +258,10 @@ async def llm_chat(req: ChatRequest):
     messages.append(HumanMessage(content=req.message))
     loop = asyncio.get_event_loop()
     response = await loop.run_in_executor(None, lambda: llm.invoke(messages))
-    return {"response": response.content}
+    # Update chat history if chat_id is used
+    if req.chat_id:
+        chat_histories[req.chat_id] = (history or []) + [{"role": "user", "content": req.message}, {"role": "assistant", "content": response.content}]
+    return {"response": response.content, "chat_id": req.chat_id}
 
 
 @app.post("/llm/agent")

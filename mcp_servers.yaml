@@ -1,13 +1,13 @@
 servers:
-  math:
-    transport: streamable_http
-    url: http://localhost:8001/mcp
-  weather:
-    transport: streamable_http
-    url: http://localhost:8000/mcp
   ds:
     transport: streamable_http
     url: http://localhost:8003/mcp
   dexdb:
     transport: streamable_http
     url: http://localhost:8004/mcp
+  sequential-thinking:
+    command: npx
+    args:
+      - -y
+      - '@modelcontextprotocol/server-sequential-thinking'
+  
