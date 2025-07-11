@@ -748,7 +748,87 @@ async def groq_structured_agent(req: ChatRequest):
             "iterations": 0,
             "agent_type": "structured-groq"
         }
+# -----------------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------------------------------
+from langchain_openai import ChatOpenAI  # or the correct import for your Mistral client
 
+@app.post("/llm/mistral-structured-agent")
+async def mistral_structured_agent(req: ChatRequest):
+    """
+    Chat endpoint using StructuredAgent with local Mistral 7B Instruct for testing.
+    """
+    servers = get_mcp_servers()
+    if not servers:
+        return {
+            "response": "No MCP servers configured.",
+            "error": True,
+            "tool_executions": [],
+            "reasoning_steps": [],
+            "formatted_output": "No MCP servers configured.",
+            "agent_type": "structured-mistral"
+        }
+    try:
+        reachable_servers = await get_reachable_servers(servers, skip_health_check=True)
+        if not reachable_servers:
+            return {
+                "response": "No MCP servers configured.",
+                "error": True,
+                "tool_executions": [],
+                "reasoning_steps": [],
+                "formatted_output": "No MCP servers configured.",
+                "agent_type": "structured-mistral"
+            }
+        print(f"Using {len(reachable_servers)} servers: {list(reachable_servers.keys())}")
+        client = MultiServerMCPClient(reachable_servers)
+        try:
+            tools = await client.get_tools()
+        except Exception as e:
+            print(f"Error getting tools, falling back to health check: {e}")
+            reachable_servers = await get_reachable_servers(servers, skip_health_check=False)
+            if not reachable_servers:
+                return {
+                    "response": "No MCP servers are currently reachable.",
+                    "error": True,
+                    "tool_executions": [],
+                    "reasoning_steps": [],
+                    "formatted_output": "No MCP servers are currently reachable.",
+                    "agent_type": "structured-mistral"
+                }
+            client = MultiServerMCPClient(reachable_servers)
+            tools = await client.get_tools()
+        if not tools:
+            return {
+                "response": "No tools available from reachable MCP servers.",
+                "error": True,
+                "tool_executions": [],
+                "reasoning_steps": [],
+                "formatted_output": "No tools available from reachable MCP servers.",
+                "agent_type": "structured-mistral"
+            }
+        # --- Mistral LLM setup ---
+        mistral_llm = ChatOpenAI(
+            openai_api_key="EMPTY",  # or your key if needed
+            openai_api_base="http://localhost:11434/v1",  # adjust to your Mistral endpoint
+            model="mistral:7b",  # adjust as needed
+        )
+        agent = create_react_agent(mistral_llm, tools)
+        result = await agent.ainvoke({"messages": [{"role": "user", "content": req.message}]})
+        return result
+    except Exception as e:
+        error_msg = str(e)
+        print(f"Mistral structured agent error: {error_msg}")
+        return {
+            "response": f"Mistral structured agent error: {error_msg}",
+            "formatted_output": f"Mistral structured agent error: {error_msg}",
+            "error": True,
+            "error_type": type(e).__name__,
+            "tool_executions": [],
+            "reasoning_steps": [],
+            "iterations": 0,
+            "agent_type": "structured-mistral"
+        }
+#------------------------------------------------------------------------------------------------------
+#------------------------------------------------------------------------------------------------------
 
 
 # --- Optimized: Only check reachable servers when explicitly requested ---

@@ -2,3 +2,4 @@
 .env
 License
 __pycache__
+**.parquet

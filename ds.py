@@ -1,5 +1,6 @@
 
 from enum import Enum
+import os
 from mcp.server.fastmcp import FastMCP
 from mcp.types import TextContent, Prompt, PromptArgument, Resource  
 import pandas as pd
@@ -63,7 +64,7 @@ def load_csv(args: LoadCsvArgs) -> list:
         return [TextContent(type="text", text=error_msg)]
 
 #---------------------------------------------------------------------------------------------#
-    # BIG DATA TEST
+    # BIG DATA TEST 
 #---------------------------------------------------------------------------------------------#
 # Define the arguments for loading Parquet files
 class LoadParquetArgs(BaseModel):
@@ -126,6 +127,58 @@ def big_data_prompt(parquet_path: str, topic = "General data exploration") -> st
 
 #------------------------------------------------------------------------------------------------------------#
 #------------------------------------------------------------------------------------------------------------#
+
+
+#---------------------------------------------------------------------------------------------#
+    # API CALL TEST 
+#---------------------------------------------------------------------------------------------#
+
+class ApiCallArgs(BaseModel):
+    api_url: str
+    params: Optional[Dict[str, str]] = None
+    headers: Optional[Dict[str, str]] = None
+    auth: Optional[str] = f"Bearer {os.getenv('NASDAQ_API_KEY')}"
+    request_type: Optional[str] = "GET"  # Default to GET, can be POST, PUT, etc.
+    request_body: Optional[Dict[str, str]] = None  # For POST/PUT requests
+    # api_key: Optional[str] = os.getenv("NASDAQ_API_KEY")  # Optional API key for authentication
+
+import httpx
+
+@mcp.tool()
+async def call_api(args: ApiCallArgs) -> list:
+    """Make an API call to the specified URL with optional parameters, headers, and request body."""
+    api_url = args.api_url
+    params = args.params or {}
+    headers = args.headers or {}
+    headers["Content-Type"] = "application/json"  # Default to JSON content type
+    
+    headers["Authorization"] = f"Bearer {os.getenv('NASDAQ_API_KEY')}" if "NASDAQ_API_KEY" in os.environ else headers.get("Authorization", "")
+    request_type = args.request_type.upper()
+    request_body = args.request_body or {}
+
+    try:
+        async with httpx.AsyncClient() as client:
+            if request_type == "GET":
+                response = await client.get(api_url, params=params, headers=headers)
+            elif request_type == "POST":
+                response = await client.post(api_url, json=request_body, params=params, headers=headers)
+            elif request_type == "PUT":
+                response = await client.put(api_url, json=request_body, params=params, headers=headers)
+            elif request_type == "DELETE":
+                response = await client.delete(api_url, params=params, headers=headers)
+            else:
+                return [TextContent(type="text", text=f"Unsupported request type: {request_type}")]
+
+            response.raise_for_status()  # Raise an error for bad responses
+            return [TextContent(type="text", text=response.text)]
+    except httpx.RequestError as e:
+        return [TextContent(type="text", text=f"Request error: {str(e)}")]
+    except httpx.HTTPStatusError as e:
+        return [TextContent(type="text", text=f"HTTP error: {str(e)}")]
+
+#---------------------------------------------------------------------------------------------#
+    
+#---------------------------------------------------------------------------------------------#
 
 @mcp.tool()
 def get_notes() -> list:
