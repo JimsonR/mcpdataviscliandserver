@@ -16,3 +16,4 @@ pandas
 azure-storage-blob
 pyarrow
 pandas
+pymysql
