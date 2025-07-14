@@ -65,17 +65,23 @@ def get_mcp_servers():
 async def check_server_health(server_name: str, server_config: dict) -> bool:
     """Check if a server is reachable, with caching to avoid repeated checks."""
     current_time = time.time()
-    cache_key = f"{server_name}_{server_config['url']}"
-    
+    # Use url if present, else use command+args for cache key
+    if "url" in server_config:
+        cache_key = f"{server_name}_{server_config['url']}"
+    elif "command" in server_config:
+        cache_key = f"{server_name}_{server_config['command']} {' '.join(server_config.get('args', []))}"
+    else:
+        cache_key = server_name
+
     # Check cache first
     if cache_key in _server_health_cache:
         cached_result, timestamp = _server_health_cache[cache_key]
         if current_time - timestamp < _health_cache_timeout:
             return cached_result
-    
+
     # Perform health check
     try:
-        async with Client(server_config["url"]) as client:
+        async with get_server_client(server_config) as client:
             await client.list_tools()
             _server_health_cache[cache_key] = (True, current_time)
             return True
@@ -88,15 +94,18 @@ async def get_reachable_servers(servers: dict, skip_health_check: bool = False) 
     if skip_health_check:
         # Return all servers without checking - much faster
         return servers
-    
+
     reachable_servers = {}
     for server_name, server_config in servers.items():
         if await check_server_health(server_name, server_config):
             reachable_servers[server_name] = server_config
         else:
-            print(f"Warning: MCP server '{server_name}' at {server_config['url']} is unreachable")
-    
+            # Print a warning, but avoid KeyError if 'url' is missing
+            url_or_cmd = server_config.get('url') or server_config.get('command') or 'unknown'
+            print(f"Warning: MCP server '{server_name}' at {url_or_cmd} is unreachable")
+
     return reachable_servers
+
 
 # For backward compatibility, fallback to hardcoded if YAML missing
 def get_server_cfg(server):
@@ -105,7 +114,16 @@ def get_server_cfg(server):
         raise HTTPException(status_code=404, detail=f"Server '{server}' not found.")
     return servers[server]
 
-
+def get_server_client(server_cfg):
+    if "url" in server_cfg:
+        return Client(server_cfg["url"])
+    elif "command" in server_cfg and "args" in server_cfg:
+        from fastmcp.client.transports import StdioTransport
+        # Pass command and args as separate arguments
+        transport = StdioTransport(server_cfg["command"], server_cfg["args"])
+        return Client(transport)
+    else:
+        raise HTTPException(status_code=500, detail="Server config must have either 'url' or 'command' and 'args'.")
 app = FastAPI()
 
 # Allow CORS for all origins (for development; restrict in production)
@@ -169,36 +187,40 @@ def delete_chat_session(chat_id: str):
         return {"deleted": True, "chat_id": chat_id}
     return {"deleted": False, "chat_id": chat_id, "error": "Not found"}
 
+
 @app.post("/mcp/call-tool")
 async def call_mcp_tool(server: str, tool_name: str, arguments: dict):
     server_cfg = get_server_cfg(server)
-    async with Client(server_cfg["url"]) as client:
+    async with get_server_client(server_cfg) as client:
         result = await client.call_tool(tool_name, arguments)
         return result
 
 
 # --- Optimized: Only check reachable servers on demand, not on every frontend load ---
+
 @app.get("/mcp/list-tools")
 async def list_mcp_tools(server: str):
     server_cfg = get_server_cfg(server)
-    async with Client(server_cfg["url"]) as client:
+    async with get_server_client(server_cfg) as client:
         tools = await client.list_tools()
         return [t.model_dump() if hasattr(t, 'model_dump') else t for t in tools]
+
 
 
 @app.get("/mcp/list-resources")
 async def list_mcp_resources(server: str):
     server_cfg = get_server_cfg(server)
-    async with Client(server_cfg["url"]) as client:
+    async with get_server_client(server_cfg) as client:
         resources = await client.list_resources()
         return resources
 
 # --- New endpoint: Get resource content by URI ---
+
 @app.get("/mcp/get-resource-content")
 async def get_resource_content(server: str, uri: str):
     """Fetch and return the content of a resource by its URI."""
     server_cfg = get_server_cfg(server)
-    async with Client(server_cfg["url"]) as client:
+    async with get_server_client(server_cfg) as client:
         content_list = await client.read_resource(uri)
         result = []
         for item in content_list:
@@ -218,13 +240,13 @@ async def get_resource_content(server: str, uri: str):
 @app.get("/mcp/list-prompts")
 async def list_mcp_prompts(server: str):
     server_cfg = get_server_cfg(server)
-    async with Client(server_cfg["url"]) as client:
+    async with get_server_client(server_cfg) as client:
         prompts = await client.list_prompts()
         return prompts
 @app.post("/mcp/get-prompt-content")
 async def get_prompt_content(server: str, prompt_name: str, arguments: dict = {}):
     server_cfg = get_server_cfg(server)
-    async with Client(server_cfg["url"]) as client:
+    async with get_server_client(server_cfg) as client:
         result = await client.get_prompt(prompt_name, arguments)
         # Return all messages as a list of dicts
         return [
@@ -236,17 +258,41 @@ async def get_prompt_content(server: str, prompt_name: str, arguments: dict = {}
 from langchain_core.messages import AIMessage
 
 
+
+# --- Shared chat history management function ---
+def get_and_update_chat_history(chat_id: str, req_history: list, user_message: str = None, assistant_message: str = None):
+    """
+    Retrieve and update chat history for a given chat_id.
+    - If req_history is provided and longer than stored, use it.
+    - Always append user_message and assistant_message if provided.
+    Returns the updated history.
+    """
+    if chat_id not in chat_histories:
+        chat_histories[chat_id] = []
+    stored_history = chat_histories[chat_id]
+    history = req_history
+    if history is not None and len(history) > len(stored_history):
+        chat_histories[chat_id] = history
+        stored_history = history
+    else:
+        history = stored_history
+    # Append new messages if provided
+    if user_message is not None and assistant_message is not None:
+        updated = (history or []) + [
+            {"role": "user", "content": user_message},
+            {"role": "assistant", "content": assistant_message}
+        ]
+        chat_histories[chat_id] = updated
+        return updated
+    return history or []
+
 # --- Updated /llm/chat endpoint to support tabbed chat (chat_id) ---
 @app.post("/llm/chat")
 async def llm_chat(req: ChatRequest):
-    # Use chat_id to manage history if provided
+    # Use shared function for chat history management
     history = req.history
     if req.chat_id:
-        # Use stored history if available, else initialize
-        if req.chat_id not in chat_histories:
-            chat_histories[req.chat_id] = []
-        if history is None:
-            history = chat_histories[req.chat_id]
+        history = get_and_update_chat_history(req.chat_id, req.history)
     # Build message list: history + new message
     messages = []
     if history:
@@ -260,30 +306,25 @@ async def llm_chat(req: ChatRequest):
     response = await loop.run_in_executor(None, lambda: llm.invoke(messages))
     # Update chat history if chat_id is used
     if req.chat_id:
-        chat_histories[req.chat_id] = (history or []) + [{"role": "user", "content": req.message}, {"role": "assistant", "content": response.content}]
+        get_and_update_chat_history(req.chat_id, history, req.message, response.content)
     return {"response": response.content, "chat_id": req.chat_id}
+
 
 
 @app.post("/llm/agent")
 async def llm_agent(req: ChatRequest):
     servers = get_mcp_servers()
-    
     # Safety check: ensure we have servers configured
     if not servers:
         return {"response": "No MCP servers configured.", "error": True}
-    
     try:
         # Skip health checks for faster response
         reachable_servers = await get_reachable_servers(servers, skip_health_check=True)
-        
         if not reachable_servers:
             return {"response": "No MCP servers configured.", "error": True}
-        
         print(f"Using {len(reachable_servers)} servers: {list(reachable_servers.keys())}")
-        
         client = MultiServerMCPClient(reachable_servers)
         tools = await client.get_tools()
-        
         # Safety check: ensure we have tools
         if not tools:
             # If no tools, try fallback with health check
@@ -294,31 +335,33 @@ async def llm_agent(req: ChatRequest):
             tools = await client.get_tools()
             if not tools:
                 return {"response": "No tools available from reachable MCP servers.", "error": True}
-        
         agent = create_react_agent(llm, tools)
-        
-        # Build message list: history + new message with context management
+        # --- Use shared chat history logic ---
+        history = req.history
+        if req.chat_id:
+            history = get_and_update_chat_history(req.chat_id, req.history)
+        # Limit history to last 10 messages to prevent context overflow
+        recent_history = history[-10:] if history and len(history) > 10 else history
         messages = []
-        if req.history:
-            # Limit history to last 10 messages to prevent context overflow
-            recent_history = req.history[-10:] if len(req.history) > 10 else req.history
+        if recent_history:
             for m in recent_history:
                 if m["role"] == "user":
                     messages.append(HumanMessage(content=m["content"]))
                 elif m["role"] == "assistant":
                     messages.append(AIMessage(content=m["content"]))
         messages.append(HumanMessage(content=req.message))
-        
         # Add recursion limit and timeout
         result = await agent.ainvoke(
             {"messages": messages},
             config={
-                "recursion_limit": 5,  # Further reduce to 5 to prevent context overflow
-                "max_execution_time": 30  # Reduce timeout to 30 seconds
+                "recursion_limit": 5,
+                "max_execution_time": 30
             }
         )
+        # Update chat history if chat_id is used
+        if req.chat_id:
+            get_and_update_chat_history(req.chat_id, history, req.message, result['messages'][-1].content)
         return {"response": result['messages'][-1].content}
-        
     except Exception as e:
         error_msg = str(e)
         print(f"Agent error: {error_msg}")
@@ -327,35 +370,30 @@ async def llm_agent(req: ChatRequest):
         return {"response": f"Agent error: {error_msg}", "error": True}
 
     
+
 @app.post("/llm/agent-detailed")
 async def llm_agent_detailed(req: ChatRequest):
     servers = get_mcp_servers()
-    
     # Safety check: ensure we have servers configured
     if not servers:
         return {
-            "response": "No MCP servers configured.", 
+            "response": "No MCP servers configured.",
             "error": True,
             "tool_executions": [],
             "full_conversation": []
         }
-    
     try:
         # Skip health checks for faster response
         reachable_servers = await get_reachable_servers(servers, skip_health_check=True)
-        
         if not reachable_servers:
             return {
-                "response": "No MCP servers configured.", 
+                "response": "No MCP servers configured.",
                 "error": True,
                 "tool_executions": [],
                 "full_conversation": []
             }
-        
         print(f"Using {len(reachable_servers)} servers: {list(reachable_servers.keys())}")
-        
         client = MultiServerMCPClient(reachable_servers)
-        
         # Try to get tools with fallback
         try:
             tools = await client.get_tools()
@@ -364,46 +402,47 @@ async def llm_agent_detailed(req: ChatRequest):
             reachable_servers = await get_reachable_servers(servers, skip_health_check=False)
             if not reachable_servers:
                 return {
-                    "response": "No MCP servers are currently reachable. Please check if your MCP servers are running.", 
+                    "response": "No MCP servers are currently reachable. Please check if your MCP servers are running.",
                     "error": True,
                     "tool_executions": [],
                     "full_conversation": []
                 }
             client = MultiServerMCPClient(reachable_servers)
             tools = await client.get_tools()
-        
         # Safety check: ensure we have tools
         if not tools:
             return {
-                "response": "No tools available from reachable MCP servers.", 
+                "response": "No tools available from reachable MCP servers.",
                 "error": True,
                 "tool_executions": [],
                 "full_conversation": []
             }
-        
         agent = create_react_agent(llm, tools)
-        
-        # Build message list: history + new message with context management
+        # --- Use shared chat history logic ---
+        history = req.history
+        if req.chat_id:
+            history = get_and_update_chat_history(req.chat_id, req.history)
+        # Limit history to last 10 messages to prevent context overflow
+        recent_history = history[-10:] if history and len(history) > 10 else history
         messages = []
-        if req.history:
-            # Limit history to last 10 messages to prevent context overflow
-            recent_history = req.history[-10:] if len(req.history) > 10 else req.history
+        if recent_history:
             for m in recent_history:
                 if m["role"] == "user":
                     messages.append(HumanMessage(content=m["content"]))
                 elif m["role"] == "assistant":
                     messages.append(AIMessage(content=m["content"]))
         messages.append(HumanMessage(content=req.message))
-        
         # Add recursion limit and timeout
         result = await agent.ainvoke(
             {"messages": messages},
             config={
-                "recursion_limit": 30,  # Further reduce to 5 to prevent context overflow
-                "max_execution_time": 60  # Reduce timeout to 30 seconds
+                "recursion_limit": 30,
+                "max_execution_time": 60
             }
         )
-        
+        # Update chat history if chat_id is used
+        if req.chat_id:
+            get_and_update_chat_history(req.chat_id, history, req.message, result['messages'][-1].content)
         # Extract tool execution details from the conversation
         tool_executions = []
         for message in result['messages']:
@@ -419,7 +458,6 @@ async def llm_agent_detailed(req: ChatRequest):
                     "tool_response": getattr(message, 'content', 'No content'),
                     "tool_call_id": getattr(message, 'tool_call_id', 'unknown')
                 })
-        
         return {
             "response": result['messages'][-1].content,
             "tool_executions": tool_executions,
@@ -432,103 +470,18 @@ async def llm_agent_detailed(req: ChatRequest):
                 for m in result['messages']
             ]
         }
-        
     except Exception as e:
         error_msg = str(e)
         print(f"Agent detailed error: {error_msg}")
         if "recursion" in error_msg.lower():
             return {
-                "response": "Agent hit recursion limit. The task may be too complex or tools are failing repeatedly.", 
+                "response": "Agent hit recursion limit. The task may be too complex or tools are failing repeatedly.",
                 "error": True,
                 "tool_executions": [],
                 "full_conversation": []
             }
         return {
-            "response": f"Agent error: {error_msg}", 
-            "error": True,
-            "tool_executions": [],
-            "full_conversation": []
-        }
-
-# Updated endpoint
-@app.post("/llm/agent-detailed-formatted")
-async def llm_agent_detailed_formatted(req: ChatRequest):
-    servers = get_mcp_servers()
-    
-    if not servers:
-        return {
-            "response": "No MCP servers configured.", 
-            "error": True,
-            "tool_executions": [],
-            "full_conversation": []
-        }
-    
-    try:
-        # Skip health checks for faster response
-        reachable_servers = await get_reachable_servers(servers, skip_health_check=True)
-        
-        if not reachable_servers:
-            return {
-                "response": "No MCP servers configured.", 
-                "error": True,
-                "tool_executions": [],
-                "full_conversation": []
-            }
-        
-        client = MultiServerMCPClient(reachable_servers)
-        
-        # Try to get tools with fallback
-        try:
-            tools = await client.get_tools()
-        except Exception:
-            # Fallback with health check
-            reachable_servers = await get_reachable_servers(servers, skip_health_check=False)
-            if not reachable_servers:
-                return {
-                    "response": "No MCP servers are currently reachable.", 
-                    "error": True,
-                    "tool_executions": [],
-                    "full_conversation": []
-                }
-            client = MultiServerMCPClient(reachable_servers)
-            tools = await client.get_tools()
-        
-        if not tools:
-            return {
-                "response": "No tools available from reachable MCP servers.", 
-                "error": True,
-                "tool_executions": [],
-                "full_conversation": []
-            }
-        
-        # Use structured agent
-        agent = StructuredAgent(llm, tools)
-        
-        # Build messages
-        messages = []
-        if req.history:
-            recent_history = req.history[-10:] if len(req.history) > 10 else req.history
-            for m in recent_history:
-                if m["role"] == "user":
-                    messages.append(HumanMessage(content=m["content"]))
-                elif m["role"] == "assistant":
-                    messages.append(AIMessage(content=m["content"]))
-        messages.append(HumanMessage(content=req.message))
-        
-        # Process request
-        result = await agent.process_request(messages)
-        
-        return {
-            "response": result["response"],
-            "tool_executions": result["tool_executions"],
-            "full_conversation": []
-        }
-        
-    except Exception as e:
-        error_msg = str(e)
-        print(f"Agent error: {error_msg}")
-        return {
-            "response": f"Agent error: {error_msg}", 
+            "response": f"Agent error: {error_msg}",
             "error": True,
             "tool_executions": [],
             "full_conversation": []
@@ -543,36 +496,30 @@ async def llm_structured_agent(req: ChatRequest):
     and Claude-like response formatting.
     """
     servers = get_mcp_servers()
-    
     # Safety check: ensure we have servers configured
     if not servers:
         return {
-            "response": "No MCP servers configured.", 
+            "response": "No MCP servers configured.",
             "error": True,
             "tool_executions": [],
             "reasoning_steps": [],
             "formatted_output": "No MCP servers configured.",
             "agent_type": "structured"
         }
-    
     try:
         # Skip health checks for faster initial response - servers will fail gracefully if unreachable
         reachable_servers = await get_reachable_servers(servers, skip_health_check=True)
-        
         if not reachable_servers:
             return {
-                "response": "No MCP servers configured.", 
+                "response": "No MCP servers configured.",
                 "error": True,
                 "tool_executions": [],
                 "reasoning_steps": [],
                 "formatted_output": "No MCP servers configured.",
                 "agent_type": "structured"
             }
-        
         print(f"Using {len(reachable_servers)} servers: {list(reachable_servers.keys())}")
-        
         client = MultiServerMCPClient(reachable_servers)
-        
         # Try to get tools - if any servers are unreachable, this will filter them out
         try:
             tools = await client.get_tools()
@@ -582,7 +529,7 @@ async def llm_structured_agent(req: ChatRequest):
             reachable_servers = await get_reachable_servers(servers, skip_health_check=False)
             if not reachable_servers:
                 return {
-                    "response": "No MCP servers are currently reachable. Please check if your MCP servers are running.", 
+                    "response": "No MCP servers are currently reachable. Please check if your MCP servers are running.",
                     "error": True,
                     "tool_executions": [],
                     "reasoning_steps": [],
@@ -591,24 +538,25 @@ async def llm_structured_agent(req: ChatRequest):
                 }
             client = MultiServerMCPClient(reachable_servers)
             tools = await client.get_tools()
-        
         if not tools:
             return {
-                "response": "No tools available from reachable MCP servers.", 
+                "response": "No tools available from reachable MCP servers.",
                 "error": True,
                 "tool_executions": [],
                 "reasoning_steps": [],
                 "formatted_output": "No tools available from reachable MCP servers.",
                 "agent_type": "structured"
             }
-        
         # Initialize the enhanced agent
         agent = StructuredAgent(llm, tools)
-
-        # Build message list: history + new message with context management
+        # --- Use shared chat history logic ---
+        history = req.history
+        if req.chat_id:
+            history = get_and_update_chat_history(req.chat_id, req.history)
+        # Limit history to last 10 messages to prevent context overflow
+        recent_history = history[-10:] if history and len(history) > 10 else history
         messages = []
-        if req.history:
-            recent_history = req.history[-10:] if len(req.history) > 10 else req.history
+        if recent_history:
             for m in recent_history:
                 if m["role"] == "user":
                     messages.append(HumanMessage(content=m["content"]))
@@ -616,13 +564,13 @@ async def llm_structured_agent(req: ChatRequest):
                     from langchain_core.messages import AIMessage
                     messages.append(AIMessage(content=m["content"]))
         messages.append(HumanMessage(content=req.message))
-
         # Use the enhanced invoke method
         result = await agent.invoke(messages)
-        
+        # Update chat history if chat_id is used
+        if req.chat_id:
+            get_and_update_chat_history(req.chat_id, history, req.message, result.get("response"))
         # Extract reasoning steps for detailed breakdown
         reasoning_steps = result.get("reasoning_steps", [])
-        
         # Format tool executions in the expected format (for backward compatibility)
         tool_executions = []
         for step in reasoning_steps:
@@ -632,24 +580,22 @@ async def llm_structured_agent(req: ChatRequest):
                     "arguments": tool_result["arguments"],
                     "result": tool_result["result"][:500] + "..." if len(str(tool_result["result"])) > 500 else tool_result["result"]
                 })
-
         return {
             "response": result.get("response"),
-            "formatted_output": result.get("formatted_output"),  # New: Claude-like structured response
-            "reasoning_steps": reasoning_steps,  # New: Step-by-step breakdown
-            "tool_executions": tool_executions,  # Backward compatibility
+            "formatted_output": result.get("formatted_output"),
+            "reasoning_steps": reasoning_steps,
+            "tool_executions": tool_executions,
             "iterations": result.get("iterations"),
             "messages": [getattr(m, "content", str(m)) for m in result.get("messages", [])] if "messages" in result else [],
             "success": True,
             "error": False,
             "agent_type": "structured"
         }
-        
     except Exception as e:
         error_msg = str(e)
         print(f"Structured agent error: {error_msg}")
         return {
-            "response": f"Structured agent error: {error_msg}", 
+            "response": f"Structured agent error: {error_msg}",
             "formatted_output": f"Structured agent error: {error_msg}",
             "error": True,
             "error_type": type(e).__name__,
@@ -1022,25 +968,33 @@ async def get_tool_example(tool_name: str):
         return {"error": f"Error: {str(e)}"}
 
 # --- New endpoint for checking server health on demand ---
+
 @app.get("/mcp/server-health")
 async def check_mcp_server_health():
     """Check the health status of all MCP servers. Use this when you need to know which servers are actually reachable."""
     servers = get_mcp_servers()
-    
+
     if not servers:
         return {"error": "No MCP servers configured", "servers": {}}
-    
+
     health_status = {}
     for server_name, server_config in servers.items():
         is_healthy = await check_server_health(server_name, server_config)
+        # Use url if present, else command/args for display
+        if "url" in server_config:
+            location = server_config["url"]
+        elif "command" in server_config:
+            location = f"{server_config['command']} {' '.join(server_config.get('args', []))}"
+        else:
+            location = "unknown"
         health_status[server_name] = {
-            "url": server_config["url"],
+            "location": location,
             "healthy": is_healthy,
             "status": "reachable" if is_healthy else "unreachable"
         }
-    
+
     reachable_count = sum(1 for status in health_status.values() if status["healthy"])
-    
+
     return {
         "servers": health_status,
         "total_servers": len(servers),
