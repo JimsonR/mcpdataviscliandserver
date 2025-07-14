@@ -732,6 +732,7 @@ if __name__ == "__main__":
         MYSQL_HOST = os.getenv("MYSQL_HOST")
         MYSQL_PORT = os.getenv("MYSQL_PORT")
         MYSQL_DB = os.getenv("MYSQL_DB")
+
         db_url = f"mysql+pymysql://{MYSQL_USER}:{MYSQL_PASSWORD}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DB}"
         db_engine = create_engine(db_url)
         print("[Startup] MySQL engine initialized and shared globally.")
