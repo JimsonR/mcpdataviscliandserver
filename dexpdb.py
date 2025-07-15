@@ -5,18 +5,20 @@ from mcp.types import TextContent, Prompt, PromptArgument, Resource
 import pandas as pd
 import numpy as np
 import json
-from typing import Optional, List ,Dict
+from typing import Optional, List, Dict, Any
 from pydantic import BaseModel
 
 mcp = FastMCP(name="dsdb", host="127.0.0.1", port=8004)
-
 
 # In-memory data store for loaded DataFrames
 _dataframes = {}
 _df_count = 0
 _notes: list[str] = []
+_exploration_history: list[Dict[str, Any]] = []  # Track exploration steps
+_data_insights: Dict[str, Any] = {}  # Store discovered insights
+_hypotheses: list[Dict[str, Any]] = []  # Track hypotheses and validations
 
-# Global DB engine and session (shared across all methods)
+# Global DB engine and session
 db_engine = None
 db_session = None
 
@@ -24,6 +26,19 @@ def _next_df_name():
     global _df_count
     _df_count += 1
     return f"df_{_df_count}"
+
+def _log_exploration_step(step_type: str, operation: str, result: str, insights: Dict[str, Any] = None):
+    """Log each exploration step for analysis"""
+    global _exploration_history
+    step = {
+        "step_type": step_type,
+        "operation": operation,
+        "result": result,
+        "insights": insights or {},
+        "timestamp": pd.Timestamp.now().isoformat()
+    }
+    _exploration_history.append(step)
+
 
 
 # --- DB Connection Args ---
@@ -39,33 +54,303 @@ class RunScriptArgs(BaseModel):
     script: str
     save_to_memory: Optional[List[str]] = None
 
-class SqlQueryArgs(BaseModel):
+class EnhancedSqlQueryArgs(BaseModel):
     sql: str
     df_name: Optional[str] = None
-# (DB connection and loading should be done manually by the user in a script, not as a tool)
+    purpose: Optional[str] = None  # Track why this query is being run
+    hypothesis: Optional[str] = None  # What hypothesis is being tested
 
 @mcp.tool()
-def run_sql_query(args: SqlQueryArgs) -> list:
-    """Run a SQL query on the connected MySQL database and load the result into a DataFrame.
-    The connection uses environment variables MYSQL_USER, MYSQL_PASSWORD, MYSQL_HOST, MYSQL_PORT, MYSQL_DB.
-    sql: The SQL query to execute (e.g., SELECT ...)
-    df_name: Optional DataFrame name (auto-assigned if not provided)
-    """
-    global _dataframes, _notes
-    global db_engine
+def run_sql_query_enhanced(args: EnhancedSqlQueryArgs) -> list:
+    """Enhanced SQL query with exploration tracking and automatic insights generation."""
+    global _dataframes, _notes, _data_insights
     sql = args.sql
     df_name = args.df_name or _next_df_name()
+    purpose = args.purpose or "General query"
+    hypothesis = args.hypothesis
     try:
         if db_engine is None:
-            return [TextContent(type="text", text="Database engine is not initialized. Startup connection failed or not configured.")]
+            return [TextContent(type="text", text="Database engine is not initialized.")]
         df = pd.read_sql_query(sql, db_engine)
         _dataframes[df_name] = df
-        _notes.append(f"Loaded SQL query into dataframe '{df_name}' ({len(df)} rows)")
-        return [TextContent(type="text", text=f"Loaded SQL query into dataframe '{df_name}' ({len(df)} rows)")]
+        # Generate automatic insights
+        insights = _generate_dataframe_insights(df, df_name)
+        _data_insights[df_name] = insights
+        # Log exploration step
+        _log_exploration_step(
+            step_type="sql_query",
+            operation=sql,
+            result=f"Loaded {len(df)} rows into {df_name}",
+            insights=insights
+        )
+        # Validate hypothesis if provided
+        if hypothesis:
+            validation = _validate_hypothesis(hypothesis, df, insights)
+            _hypotheses.append({
+                "hypothesis": hypothesis,
+                "validation": validation,
+                "dataframe": df_name,
+                "timestamp": pd.Timestamp.now().isoformat()
+            })
+        result_text = f"Loaded SQL query into dataframe '{df_name}' ({len(df)} rows)\n"
+        result_text += f"Purpose: {purpose}\n"
+        result_text += f"Automatic insights: {insights.get('summary', 'No insights generated')}"
+        _notes.append(result_text)
+        return [TextContent(type="text", text=result_text)]
     except Exception as e:
         error_msg = f"Error running SQL: {str(e)}"
+        _log_exploration_step("sql_error", sql, error_msg)
         _notes.append(error_msg)
         return [TextContent(type="text", text=error_msg)]
+
+def _generate_dataframe_insights(df: pd.DataFrame, df_name: str) -> Dict[str, Any]:
+    """Generate automatic insights about a DataFrame (inspired by RAISE's data understanding)"""
+    insights = {}
+    try:
+        # Basic statistics
+        insights["shape"] = df.shape
+        insights["columns"] = list(df.columns)
+        insights["dtypes"] = df.dtypes.to_dict()
+        # Data quality insights
+        insights["missing_values"] = df.isnull().sum().to_dict()
+        insights["duplicate_rows"] = df.duplicated().sum()
+        # Numeric columns insights
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        if len(numeric_cols) > 0:
+            insights["numeric_summary"] = df[numeric_cols].describe().to_dict()
+        # Categorical insights
+        categorical_cols = df.select_dtypes(include=['object']).columns
+        if len(categorical_cols) > 0:
+            insights["categorical_summary"] = {}
+            for col in categorical_cols:
+                insights["categorical_summary"][col] = {
+                    "unique_values": df[col].nunique(),
+                    "top_values": df[col].value_counts().head(5).to_dict()
+                }
+        # Potential issues detection
+        issues = []
+        if df.duplicated().sum() > 0:
+            issues.append(f"Found {df.duplicated().sum()} duplicate rows")
+        high_missing = df.isnull().sum()
+        high_missing_cols = high_missing[high_missing > len(df) * 0.1].index.tolist()
+        if high_missing_cols:
+            issues.append(f"High missing values in columns: {high_missing_cols}")
+        insights["potential_issues"] = issues
+        # Generate summary
+        insights["summary"] = f"DataFrame with {df.shape[0]} rows and {df.shape[1]} columns. "
+        if issues:
+            insights["summary"] += f"Potential issues: {'; '.join(issues)}"
+        else:
+            insights["summary"] += "No obvious data quality issues detected."
+    except Exception as e:
+        insights["error"] = f"Error generating insights: {str(e)}"
+    return insights
+
+def _validate_hypothesis(hypothesis: str, df: pd.DataFrame, insights: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate a hypothesis against the data"""
+    validation = {
+        "hypothesis": hypothesis,
+        "status": "unknown",
+        "evidence": [],
+        "confidence": 0.0
+    }
+    try:
+        # Simple keyword-based validation (could be enhanced with NLP)
+        if "missing" in hypothesis.lower() or "null" in hypothesis.lower():
+            missing_info = insights.get("missing_values", {})
+            if any(count > 0 for count in missing_info.values()):
+                validation["status"] = "supported"
+                validation["evidence"].append(f"Missing values found: {missing_info}")
+                validation["confidence"] = 0.8
+            else:
+                validation["status"] = "not_supported"
+                validation["evidence"].append("No missing values found")
+                validation["confidence"] = 0.9
+        elif "duplicate" in hypothesis.lower():
+            dup_count = insights.get("duplicate_rows", 0)
+            if dup_count > 0:
+                validation["status"] = "supported"
+                validation["evidence"].append(f"Found {dup_count} duplicate rows")
+                validation["confidence"] = 0.9
+            else:
+                validation["status"] = "not_supported"
+                validation["evidence"].append("No duplicate rows found")
+                validation["confidence"] = 0.9
+        # Add more hypothesis validation patterns as needed
+    except Exception as e:
+        validation["error"] = f"Error validating hypothesis: {str(e)}"
+    return validation
+
+class DataExplorationArgs(BaseModel):
+    df_name: str
+    exploration_type: str  # "quality", "relationships", "patterns", "anomalies"
+    specific_columns: Optional[List[str]] = None
+
+@mcp.tool()
+def explore_data_patterns(args: DataExplorationArgs) -> list:
+    """Systematic data exploration inspired by RAISE's database exploration strategy"""
+    global _dataframes, _data_insights
+    df_name = args.df_name
+    exploration_type = args.exploration_type
+    specific_columns = args.specific_columns
+    if df_name not in _dataframes:
+        return [TextContent(type="text", text=f"DataFrame '{df_name}' not found. Available: {list(_dataframes.keys())}")]
+    df = _dataframes[df_name]
+    results = []
+    try:
+        if exploration_type == "quality":
+            quality_report = _explore_data_quality(df, specific_columns)
+            results.append(f"Data Quality Report for {df_name}:")
+            results.append(quality_report)
+        elif exploration_type == "relationships":
+            relationship_report = _explore_relationships(df, specific_columns)
+            results.append(f"Relationship Analysis for {df_name}:")
+            results.append(relationship_report)
+        elif exploration_type == "patterns":
+            pattern_report = _explore_patterns(df, specific_columns)
+            results.append(f"Pattern Analysis for {df_name}:")
+            results.append(pattern_report)
+        elif exploration_type == "anomalies":
+            anomaly_report = _detect_anomalies(df, specific_columns)
+            results.append(f"Anomaly Detection for {df_name}:")
+            results.append(anomaly_report)
+        result_text = "\n".join(results)
+        _log_exploration_step(
+            step_type="data_exploration",
+            operation=f"{exploration_type} exploration on {df_name}",
+            result=result_text[:200] + "..." if len(result_text) > 200 else result_text
+        )
+        return [TextContent(type="text", text=result_text)]
+    except Exception as e:
+        error_msg = f"Error in data exploration: {str(e)}"
+        return [TextContent(type="text", text=error_msg)]
+
+def _explore_data_quality(df: pd.DataFrame, columns: Optional[List[str]] = None) -> str:
+    if columns:
+        df = df[columns]
+    report = []
+    missing = df.isnull().sum()
+    if missing.sum() > 0:
+        report.append("Missing Values:")
+        for col, count in missing.items():
+            if count > 0:
+                pct = (count / len(df)) * 100
+                report.append(f"  {col}: {count} ({pct:.1f}%)")
+    duplicates = df.duplicated().sum()
+    if duplicates > 0:
+        report.append(f"Duplicate rows: {duplicates}")
+    report.append("Data Types:")
+    for col, dtype in df.dtypes.items():
+        report.append(f"  {col}: {dtype}")
+    return "\n".join(report) if report else "No data quality issues detected"
+
+def _explore_relationships(df: pd.DataFrame, columns: Optional[List[str]] = None) -> str:
+    if columns:
+        df = df[columns]
+    report = []
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    if len(numeric_cols) > 1:
+        corr_matrix = df[numeric_cols].corr()
+        high_corr = []
+        for i in range(len(corr_matrix.columns)):
+            for j in range(i+1, len(corr_matrix.columns)):
+                corr_val = corr_matrix.iloc[i, j]
+                if abs(corr_val) > 0.7:
+                    high_corr.append(f"{corr_matrix.columns[i]} - {corr_matrix.columns[j]}: {corr_val:.3f}")
+        if high_corr:
+            report.append("High Correlations (>0.7):")
+            report.extend([f"  {item}" for item in high_corr])
+    return "\n".join(report) if report else "No significant relationships detected"
+
+def _explore_patterns(df: pd.DataFrame, columns: Optional[List[str]] = None) -> str:
+    if columns:
+        df = df[columns]
+    report = []
+    categorical_cols = df.select_dtypes(include=['object']).columns
+    for col in categorical_cols:
+        unique_ratio = df[col].nunique() / len(df)
+        if unique_ratio < 0.1:
+            top_values = df[col].value_counts().head(3)
+            report.append(f"{col} - Top values: {top_values.to_dict()}")
+    return "\n".join(report) if report else "No significant patterns detected"
+
+def _detect_anomalies(df: pd.DataFrame, columns: Optional[List[str]] = None) -> str:
+    if columns:
+        df = df[columns]
+    report = []
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    for col in numeric_cols:
+        Q1 = df[col].quantile(0.25)
+        Q3 = df[col].quantile(0.75)
+        IQR = Q3 - Q1
+        lower_bound = Q1 - 1.5 * IQR
+        upper_bound = Q3 + 1.5 * IQR
+        outliers = df[(df[col] < lower_bound) | (df[col] > upper_bound)]
+        if len(outliers) > 0:
+            report.append(f"{col}: {len(outliers)} outliers detected")
+    return "\n".join(report) if report else "No anomalies detected"
+
+class HypothesisArgs(BaseModel):
+    hypothesis: str
+    df_name: str
+    test_query: Optional[str] = None
+
+@mcp.tool()
+def test_hypothesis(args: HypothesisArgs) -> list:
+    """Test a hypothesis about the data"""
+    global _dataframes, _hypotheses
+    hypothesis = args.hypothesis
+    df_name = args.df_name
+    test_query = args.test_query
+    if df_name not in _dataframes:
+        return [TextContent(type="text", text=f"DataFrame '{df_name}' not found")]
+    df = _dataframes[df_name]
+    if test_query:
+        try:
+            result = eval(test_query, {"df": df, "pd": pd, "np": np})
+            validation = {
+                "hypothesis": hypothesis,
+                "test_query": test_query,
+                "result": str(result),
+                "status": "tested",
+                "timestamp": pd.Timestamp.now().isoformat()
+            }
+            _hypotheses.append(validation)
+            return [TextContent(type="text", text=f"Hypothesis: {hypothesis}\nTest: {test_query}\nResult: {result}")]
+        except Exception as e:
+            return [TextContent(type="text", text=f"Error testing hypothesis: {str(e)}")]
+    insights = _data_insights.get(df_name, {})
+    validation = _validate_hypothesis(hypothesis, df, insights)
+    _hypotheses.append(validation)
+    result_text = f"Hypothesis: {hypothesis}\n"
+    result_text += f"Status: {validation['status']}\n"
+    result_text += f"Evidence: {'; '.join(validation['evidence'])}\n"
+    result_text += f"Confidence: {validation['confidence']}"
+    return [TextContent(type="text", text=result_text)]
+
+@mcp.tool()
+def get_exploration_history() -> list:
+    """Get the complete exploration history with insights"""
+    global _exploration_history, _hypotheses
+    if not _exploration_history:
+        return [TextContent(type="text", text="No exploration history available")]
+    result = "=== EXPLORATION HISTORY ===\n\n"
+    for i, step in enumerate(_exploration_history, 1):
+        result += f"Step {i}: {step['step_type']}\n"
+        result += f"  Operation: {step['operation']}\n"
+        result += f"  Result: {step['result']}\n"
+        if step['insights']:
+            result += f"  Insights: {step['insights']}\n"
+        result += f"  Time: {step['timestamp']}\n\n"
+    if _hypotheses:
+        result += "=== HYPOTHESIS VALIDATION HISTORY ===\n\n"
+        for i, hyp in enumerate(_hypotheses, 1):
+            result += f"Hypothesis {i}: {hyp['hypothesis']}\n"
+            result += f"  Status: {hyp['status']}\n"
+            if 'evidence' in hyp:
+                result += f"  Evidence: {'; '.join(hyp['evidence'])}\n"
+            result += f"  Time: {hyp['timestamp']}\n\n"
+    return [TextContent(type="text", text=result)]
 # Tool: List all MySQL table names and their columns/attributes
 class ListTablesArgs(BaseModel):
     pass
@@ -137,75 +422,50 @@ def preview_dataframe(args: PreviewDataFrameArgs) -> list:
 
 @mcp.tool()
 def run_script(args: RunScriptArgs) -> list:
-    """Execute a Python script for data analytics tasks.
-    Do list_dataframes before using this tool to ensure you know the available DataFrames and their columns.
-    This tool allows you to run scripts that can analyze, process, and visualize data using pandas."""
+    """Execute a Python script with enhanced tracking and insights"""
     global _dataframes, _notes
+    # Your existing run_script implementation, but add exploration tracking
     if not hasattr(run_script, "_memory"):
         run_script._memory = {}
     memory = run_script._memory
     script = args.script
     save_to_memory = args.save_to_memory
-    
     # Basic validation
     if 'pd.read_csv(' in script:
         return [TextContent(type="text", text="ERROR: Use list_dataframes to check the available dataframes instead of pd.read_csv()")]
     if any(pattern in script for pattern in ['import matplotlib', 'plt.show(', 'plt.figure(']):
         return [TextContent(type="text", text="ERROR: Use DataFrame.plot() methods instead of matplotlib")]
-    
     # If script is a single variable name, try to return from memory
     if isinstance(script, str) and script.strip() in memory and (not ("\n" in script or ";" in script)):
         val = memory[script.strip()]
         return [TextContent(type="text", text=repr(val))]
-    
-    # Import required libraries
     import pandas as pd
     import numpy as np
     import sys
     import io
     import traceback
-    
-    # Prepare execution context
     local_vars = {**_dataframes, **memory}
-    
-    # Initialize variables that will be used in finally block
     stdout = io.StringIO()
-    sys_stdout = sys.stdout  # Store original stdout before any try block
+    sys_stdout = sys.stdout
     result = None
-    
     try:
-        # Split script into lines, try to eval last line if possible
         lines = script.strip().split("\n")
-        # Remove empty lines at end
         while lines and not lines[-1].strip():
             lines.pop()
         last_line = lines[-1] if lines else ""
         body = "\n".join(lines[:-1])
-        
-        # Prepare globals for exec/eval: include builtins, pd, np
         exec_globals = globals().copy()
         exec_globals.update({'pd': pd, 'np': np})
-        
-        # Redirect stdout
         sys.stdout = stdout
-        
-        # Execute all but last line
         if body.strip():
             exec(body, exec_globals, local_vars)
-        
-        # Try to eval last line
         try:
             result = eval(last_line, exec_globals, local_vars)
         except Exception:
-            # If eval fails, exec last line
             exec(last_line, exec_globals, local_vars)
             result = None
-        
-        # Save to memory if requested
-        # Check if save_to_memory was set in the script itself
         if 'save_to_memory' in local_vars and isinstance(local_vars['save_to_memory'], list):
             save_to_memory = local_vars['save_to_memory']
-        
         saved_vars = []
         if save_to_memory:
             for idx, name in enumerate(save_to_memory):
@@ -214,40 +474,37 @@ def run_script(args: RunScriptArgs) -> list:
                     val = local_vars[name]
                 elif name in locals():
                     val = locals()[name]
-                # If not found, and this is the first name, and result is a DataFrame, save it
                 elif idx == 0 and isinstance(result, pd.DataFrame):
                     val = result
                 if val is not None:
                     memory[name] = val
                     saved_vars.append(name)
-                    # If it's a DataFrame or Series, also add to _dataframes
                     if isinstance(val, (pd.DataFrame, pd.Series)):
                         _dataframes[name] = val
             if saved_vars:
                 _notes.append(f"Saved to memory: {', '.join(saved_vars)}")
-        
-        # If result is None, but stdout has output, return that
         output_text = stdout.getvalue().strip()
         if result is not None:
             output = repr(result)
         elif output_text:
             output = output_text
         else:
-            # Check if we saved anything and report it
             if save_to_memory and saved_vars:
                 output = f"Script executed successfully. Saved to memory: {', '.join(saved_vars)}"
             else:
                 output = "Script executed successfully (no output)"
-            
     except Exception as e:
         tb = traceback.format_exc()
         output = f"Error: {str(e)}\n{tb}"
-        
     finally:
-        # Restore original stdout (sys_stdout is guaranteed to be defined)
         sys.stdout = sys_stdout
-    
     _notes.append(f"Script executed: {output[:100]}...")
+    # After execution, log the exploration step
+    _log_exploration_step(
+        step_type="script_execution",
+        operation=script[:100] + "..." if len(script) > 100 else script,
+        result="Script executed successfully"
+    )
     return [TextContent(type="text", text=output)]
 @mcp.tool()
 def list_dataframes() -> list:
@@ -266,40 +523,6 @@ def list_dataframes() -> list:
     return [TextContent(type="text", text=result)]
 
 
-
-# @mcp.tool()
-# def create_simple_chart(df_name: str, chart_type: str, column: str = None) -> list:
-#     """Create simple chart data for visualization."""
-#     global _dataframes
-    
-#     if df_name not in _dataframes:
-#         return [TextContent(type="text", text=f"DataFrame '{df_name}' not found")]
-    
-#     df = _dataframes[df_name]
-    
-#     try:
-#         if chart_type == "histogram" and column:
-#             values = df[column].dropna().tolist()
-#             chart_data = {
-#                 "type": "histogram",
-#                 "data": values,
-#                 "title": f"Distribution of {column}",
-#                 "column": column
-#             }
-#         elif chart_type == "line" and column:
-#             chart_data = {
-#                 "type": "line", 
-#                 "data": df[column].tolist(),
-#                 "title": f"{column} Over Time",
-#                 "column": column
-#             }
-#         else:
-#             return [TextContent(type="text", text="Supported: histogram, line")]
-        
-#         return [TextContent(type="text", text=json.dumps(chart_data, indent=2))]
-    
-#     except Exception as e:
-#         return [TextContent(type="text", text=f"Error creating chart: {str(e)}")]
 
 @mcp.tool()
 
@@ -1024,104 +1247,6 @@ class PromptArgs(str, Enum):
     CSV_PATH = "csv_path"
     TOPIC = "topic"
 
-# PROMPT_TEMPLATE = """
-# You are a professional Data Scientist tasked with performing exploratory data analysis on a dataset. Your goal is to provide insightful analysis while ensuring stability and manageable result sizes.
-
-# First, load the CSV file from the following path:
-
-# <csv_path>
-# {csv_path}
-# </csv_path>
-
-# Your analysis should focus on the following topic:
-
-# <analysis_topic>
-# {topic}
-# </analysis_topic>
-
-# You have access to the following tools for your analysis:
-# 1. load_csv: Use this to load the CSV file.
-# 2. list_dataframes: Use this to see all available DataFrames and their columns.
-# 3. list_supported_chart_types: Use this to see all supported chart types for visualization.
-# 4. run_script: Use this to execute Python scripts on the MCP server.
-# 5. create_visualization: Use this to create charts from DataFrames.
-
-# Important: Before using run_script or create_visualization, always call list_dataframes to discover available DataFrames and their columns, and call list_supported_chart_types to discover supported chart types.
-
-# Please follow these steps carefully:
-
-# 1. Load the CSV file using the load_csv tool.
-
-# 2. Call list_dataframes to see all available DataFrames and their columns.
-
-# 3. Call list_supported_chart_types to see all supported chart types for visualization.
-
-# 4. Explore the dataset. Provide a brief summary of its structure, including the number of rows, columns, and data types. Wrap your exploration process in <dataset_exploration> tags, including:
-#    - List of key statistics about the dataset
-#    - Potential challenges you foresee in analyzing this data
-
-# 5. Wrap your thought process in <analysis_planning> tags:
-#    Analyze the dataset size and complexity:
-#    - How many rows and columns does it have?
-#    - Are there any potential computational challenges based on the data types or volume?
-#    - What kind of questions would be appropriate given the dataset's characteristics and the analysis topic?
-#    - How can we ensure that our questions won't result in excessively large outputs?
-
-#    Based on this analysis:
-#    - List 10 potential questions related to the analysis topic
-#    - Evaluate each question against the following criteria:
-#      * Directly related to the analysis topic
-#      * Can be answered with reasonable computational effort
-#      * Will produce manageable result sizes
-#      * Provides meaningful insights into the data
-#    - Select the top 5 questions that best meet all criteria
-
-# 6. List the 5 questions you've selected, ensuring they meet the criteria outlined above.
-
-# 7. For each question, follow these steps:
-#    a. Wrap your thought process in <analysis_planning> tags:
-#       - How can I structure the Python script to efficiently answer this question?
-#       - What data preprocessing steps are necessary?
-#       - How can I limit the output size to ensure stability?
-#       - What type of visualization would best represent the results?
-#       - Outline the main steps the script will follow
-   
-#    b. Write a Python script to answer the question. Include comments explaining your approach and any measures taken to limit output size.
-   
-#    c. Use the run_script tool to execute your Python script on the MCP server.
-   
-
-# 8. After completing the analysis for all 5 questions, provide a brief summary of your findings and any overarching insights gained from the data.
-
-# Remember to prioritize stability and manageability in your analysis. If at any point you encounter potential issues with large result sets, adjust your approach accordingly.
-
-# Please begin your analysis by loading the CSV file and providing an initial exploration of the dataset.
-# """
-
-PROMPT_TEMPLATE = """
-You are a professional Data Scientist. Perform exploratory data analysis on the dataset at this path:
-
-<csv_path>
-{csv_path}
-</csv_path>
-
-Focus your analysis on: **{topic}**
-
-## Your Task:
-1. Load and explore the dataset structure
-2. Identify 3-5 key insights related to {topic}
-3. Create appropriate visualizations to support your findings
-4. Provide a concise summary of your analysis
-
-## Important Guidelines:
-- Always call `list_dataframes` before using `run_script` or `create_visualization`
-- Keep individual script outputs manageable (limit large results)
-- Focus on the most relevant insights for the given topic
-- Use visualizations to enhance understanding
-
-Begin by loading the CSV file and exploring its basic structure.
-"""
-
 # --- Prompt template for database chat/analysis ---
 DB_PROMPT_TEMPLATE = """
 You are a professional Data Scientist and SQL expert. You have access to a MySQL database connection and a set of tools for querying, exploring, and visualizing data.
@@ -1154,56 +1279,9 @@ Begin by exploring the database schema and proceed step by step for each user qu
 
 class DataExplorationTools(str, Enum):
 
-
-
     LOAD_CSV = "load_csv"
     RUN_SCRIPT = "run_script"
 
-LOAD_CSV_TOOL_DESCRIPTION = """
-Load CSV File Tool
-
-Purpose:
-Load a local CSV file into a DataFrame.
-
-Usage Notes:
-    •	If a df_name is not provided, the tool will automatically assign names sequentially as df_1, df_2, and so on.
-    •	NEVER load CSV files in run_script - use this tool exclusively for CSV loading.
-"""
-
-RUN_SCRIPT_TOOL_DESCRIPTION = """
-Python Script Execution Tool
-
-Purpose:
-Execute Python scripts for specific data analytics tasks.
-
-Allowed Actions
-    1.	Print Results: Output will be displayed as the script's stdout.
-    2.	[Optional] Save DataFrames: Store DataFrames in memory for future use by specifying a save_to_memory name.
-    3.	Data Analysis: Calculate statistics, aggregations, correlations, etc.
-    4.	Data Processing: Clean, transform, filter, group data.
-    5.	DataFrame Charts: Use DataFrame.plot() methods - charts will auto-display in frontend!
-
-Prohibited Actions
-    1.	Overwriting Original DataFrames: Do not modify existing DataFrames to preserve their integrity for future tasks.
-    2.	Loading CSV files: Use load_csv tool instead. Scripts should only work with DataFrames already in memory.
-    3.	Direct matplotlib usage: Use DataFrame.plot() methods instead of plt.show(), plt.figure(), etc.
-    4.	Saving Files: Scripts should not save files, only print results and create charts.
-
-Available DataFrames: df_1, df_2, etc. (loaded via load_csv tool)
-
-Chart Examples (Auto-Display):
-- df.plot(kind='bar', title='Bar Chart') - Bar chart
-- df.plot(kind='line', x='date', y='value') - Line chart
-- df['column'].value_counts().plot(kind='pie') - Pie chart
-- df.plot(kind='scatter', x='col1', y='col2') - Scatter plot
-- df.plot(kind='hist', bins=20) - Histogram
-
-Best Practices:
-- Use df.plot() methods for charts that will auto-display
-- Print summary statistics and insights
-- Combine charts with printed analysis for complete insights
-- Focus on meaningful visualizations that tell a story
-"""
 
 @mcp.prompt()
 def explore_data_prompt():

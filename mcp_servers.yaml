@@ -5,10 +5,11 @@ servers:
   dexdb:
     transport: streamable_http
     url: http://localhost:8004/mcp
-  # sequential-thinking:
-  #   command: npx
-  #   args:
-  #     - -y
-  #     - '@modelcontextprotocol/server-sequential-thinking'
-  #   transport: stdio
+  simple-arxiv:
+    command: "C:/Users/1807/AppDataLocal/Programs/Python/Python311/python.exe"
+    args:
+      - -m
+      - mcp-simple-arxiv
+    transport: stdio
+  
   
