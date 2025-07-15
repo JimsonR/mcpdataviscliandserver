@@ -64,6 +64,8 @@ class EnhancedSqlQueryArgs(BaseModel):
 def run_sql_query_enhanced(args: EnhancedSqlQueryArgs) -> list:
     """Enhanced SQL query with exploration tracking and automatic insights generation."""
     global _dataframes, _notes, _data_insights
+    global db_engine  # <-- Add this line
+
     sql = args.sql
     df_name = args.df_name or _next_df_name()
     purpose = args.purpose or "General query"
@@ -102,7 +104,34 @@ def run_sql_query_enhanced(args: EnhancedSqlQueryArgs) -> list:
         _log_exploration_step("sql_error", sql, error_msg)
         _notes.append(error_msg)
         return [TextContent(type="text", text=error_msg)]
+    
+# class SqlQueryArgs(BaseModel):
+#     sql: str
+#     df_name: Optional[str] = None  # Optional name for the DataFrame to store results
 
+# @mcp.tool()
+# def run_sql_query(args: SqlQueryArgs) -> list:
+#     """Run a SQL query on the connected MySQL database and load the result into a DataFrame.
+#     The connection uses environment variables MYSQL_USER, MYSQL_PASSWORD, MYSQL_HOST, MYSQL_PORT, MYSQL_DB.
+#     sql: The SQL query to execute (e.g., SELECT ...)
+#     df_name: Optional DataFrame name (auto-assigned if not provided)
+#     """
+#     global _dataframes, _notes
+#     global db_engine
+#     sql = args.sql
+#     df_name = args.df_name or _next_df_name()
+#     try:
+#         if db_engine is None:
+#             return [TextContent(type="text", text="Database engine is not initialized. Startup connection failed or not configured.")]
+#         df = pd.read_sql_query(sql, db_engine)
+#         _dataframes[df_name] = df
+#         _notes.append(f"Loaded SQL query into dataframe '{df_name}' ({len(df)} rows)")
+#         return [TextContent(type="text", text=f"Loaded SQL query into dataframe '{df_name}' ({len(df)} rows)")]
+#     except Exception as e:
+#         error_msg = f"Error running SQL: {str(e)}"
+#         _notes.append(error_msg)
+#         return [TextContent(type="text", text=error_msg)]
+    
 def _generate_dataframe_insights(df: pd.DataFrame, df_name: str) -> Dict[str, Any]:
     """Generate automatic insights about a DataFrame (inspired by RAISE's data understanding)"""
     insights = {}
@@ -511,7 +540,7 @@ def list_dataframes() -> list:
     """List all DataFrames currently loaded in memory."""
     global _dataframes
     if not _dataframes:
-        return [TextContent(type="text", text="No DataFrames loaded. Use load_csv tool first.")]
+        return [TextContent(type="text", text="No DataFrames loaded. Use run_sql_query_enhanced tool first.")]
     
     result = "=== DATAFRAMES IN MEMORY ===\n\n"
     for name, df in _dataframes.items():
