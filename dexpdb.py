@@ -73,7 +73,9 @@ def run_sql_query_enhanced(args: EnhancedSqlQueryArgs) -> list:
     try:
         if db_engine is None:
             return [TextContent(type="text", text="Database engine is not initialized.")]
-        df = pd.read_sql_query(sql, db_engine)
+        from sqlalchemy import text
+        with db_engine.connect() as conn:
+            df = pd.read_sql_query(text(sql), conn)
         _dataframes[df_name] = df
         # Generate automatic insights
         insights = _generate_dataframe_insights(df, df_name)
@@ -105,32 +107,7 @@ def run_sql_query_enhanced(args: EnhancedSqlQueryArgs) -> list:
         _notes.append(error_msg)
         return [TextContent(type="text", text=error_msg)]
     
-# class SqlQueryArgs(BaseModel):
-#     sql: str
-#     df_name: Optional[str] = None  # Optional name for the DataFrame to store results
 
-# @mcp.tool()
-# def run_sql_query(args: SqlQueryArgs) -> list:
-#     """Run a SQL query on the connected MySQL database and load the result into a DataFrame.
-#     The connection uses environment variables MYSQL_USER, MYSQL_PASSWORD, MYSQL_HOST, MYSQL_PORT, MYSQL_DB.
-#     sql: The SQL query to execute (e.g., SELECT ...)
-#     df_name: Optional DataFrame name (auto-assigned if not provided)
-#     """
-#     global _dataframes, _notes
-#     global db_engine
-#     sql = args.sql
-#     df_name = args.df_name or _next_df_name()
-#     try:
-#         if db_engine is None:
-#             return [TextContent(type="text", text="Database engine is not initialized. Startup connection failed or not configured.")]
-#         df = pd.read_sql_query(sql, db_engine)
-#         _dataframes[df_name] = df
-#         _notes.append(f"Loaded SQL query into dataframe '{df_name}' ({len(df)} rows)")
-#         return [TextContent(type="text", text=f"Loaded SQL query into dataframe '{df_name}' ({len(df)} rows)")]
-#     except Exception as e:
-#         error_msg = f"Error running SQL: {str(e)}"
-#         _notes.append(error_msg)
-#         return [TextContent(type="text", text=error_msg)]
     
 def _generate_dataframe_insights(df: pd.DataFrame, df_name: str) -> Dict[str, Any]:
     """Generate automatic insights about a DataFrame (inspired by RAISE's data understanding)"""
@@ -1268,6 +1245,42 @@ def list_supported_chart_types() -> list:
 ### Data Exploration Tools Description & Schema
 _dataframes: Dict[str, pd.DataFrame] = {}
 
+# --- Table preview resource pattern ---
+_last_table_preview = None  # Global cache for last prepared table preview
+
+
+class PrepareTableResourceArgs(BaseModel):
+    df_name: str
+    n: int = 5
+    title: str = None
+
+@mcp.tool()
+def prepare_table_resource(args: PrepareTableResourceArgs) -> list:
+    """Prepare a DataFrame preview for the frontend resource in CSV format. Does NOT return the table to the LLM."""
+    global _dataframes, _last_table_preview
+    df_name = args.df_name
+    n = args.n
+    title = args.title if args.title else f"{df_name} (first {n} rows)"
+    if df_name not in _dataframes:
+        return [TextContent(type="text", text=f"DataFrame '{df_name}' not found. Available: {list(_dataframes.keys())}")]
+    df = _dataframes[df_name]
+    csv_data = df.head(n).to_csv(index=False)
+    _last_table_preview = None  # Reset previous preview
+    _last_table_preview = {
+        "title": title,
+        "csv": csv_data
+    }
+    return [TextContent(type="text", text=f"Table preview for '{df_name}' ({n} rows, CSV format) prepared. Fetch via resource.")]
+
+@mcp.resource("data-exploration://table-preview", mime_type="application/json")
+def table_preview_resource():
+    """Return the last prepared table preview (for frontend display only)."""
+    global _last_table_preview
+    if _last_table_preview is None:
+        return {"error": "No table preview prepared. Use the prepare_table_resource tool first."}
+    return _last_table_preview
+
+
 ### Prompt templates
 class DataExplorationPrompts(str, Enum):
     EXPLORE_DATA = "explore-data"
@@ -1283,18 +1296,18 @@ You are a professional Data Scientist and SQL expert. You have access to a MySQL
 ## Your Task:
 1. Explore the database schema (tables and columns) using the `list_db_tables` tool.
 2. For any analysis, always:
-   - Use `run_sql_query` to run SQL queries and load results into DataFrames.
+   - Use `run_sql_query_enhanced` to run SQL queries and load results into DataFrames.
    - Use `list_dataframes` to see available DataFrames and their columns.
    - Use `create_visualization` to generate charts from DataFrames.
 3. When asked a question, follow this process:
    - Identify which tables and columns are relevant.
    - Write a SQL query to answer the question (limit results if needed).
-   - Load the query result into a DataFrame using `run_sql_query`.
+   - Load the query result into a DataFrame using `run_sql_query_enhanced`.
    - Analyze the DataFrame and, if appropriate, create a visualization.
    - Summarize your findings concisely.
 
 ## Important Guidelines:
-- Always use the tools (`list_db_tables`, `run_sql_query`, `list_dataframes`, `create_visualization`) for all data access and analysis.
+- Always use the tools (`list_db_tables`, `run_sql_query_enhanced`, `list_dataframes`, `create_visualization`) for all data access and analysis.
 - Never access the database directly except through the provided tools.
 - Limit query result sizes to avoid large outputs (e.g., use LIMIT or aggregation).
 - If you are unsure about the schema, call `list_db_tables` first.
@@ -1314,7 +1327,7 @@ class DataExplorationTools(str, Enum):
 
 @mcp.prompt()
 def explore_data_prompt():
-    """A prompt to explore a CSV dataset as a data scientist"""
+    """A prompt to explore a  database as a data scientist"""
     print("Registering explore_data_prompt")
     return DB_PROMPT_TEMPLATE
 
