@@ -42,9 +42,7 @@ def _log_exploration_step(step_type: str, operation: str, result: str, insights:
 
 
 # --- DB Connection Args ---
-class LoadCsvArgs(BaseModel):
-    csv_path: str
-    df_name: Optional[str] = None
+
 
 
 # Remove LoadDbArgs and load_db tool, user will handle DB connection manually
@@ -63,8 +61,8 @@ class EnhancedSqlQueryArgs(BaseModel):
 @mcp.tool()
 def run_sql_query_enhanced(args: EnhancedSqlQueryArgs) -> list:
     """Enhanced SQL query with exploration tracking and automatic insights generation."""
-    global _dataframes, _notes, _data_insights
-    global db_engine  # <-- Add this line
+    global _dataframes, _notes, _data_insights, _last_table_preview
+    global db_engine
 
     sql = args.sql
     df_name = args.df_name or _next_df_name()
@@ -77,6 +75,10 @@ def run_sql_query_enhanced(args: EnhancedSqlQueryArgs) -> list:
         with db_engine.connect() as conn:
             df = pd.read_sql_query(text(sql), conn)
         _dataframes[df_name] = df
+
+        # Reset table preview cache when a new DataFrame is loaded
+        _last_table_preview = None
+
         # Generate automatic insights
         insights = _generate_dataframe_insights(df, df_name)
         _data_insights[df_name] = insights
@@ -106,7 +108,6 @@ def run_sql_query_enhanced(args: EnhancedSqlQueryArgs) -> list:
         _log_exploration_step("sql_error", sql, error_msg)
         _notes.append(error_msg)
         return [TextContent(type="text", text=error_msg)]
-    
 
     
 def _generate_dataframe_insights(df: pd.DataFrame, df_name: str) -> Dict[str, Any]:
@@ -409,21 +410,21 @@ def get_notes() -> list:
     global _notes
     return [TextContent(type="text", text="\n".join(_notes))]
 
-class PreviewDataFrameArgs(BaseModel):
-    df_name: str
-    n: int = 5  # Number of rows to preview
+# class PreviewDataFrameArgs(BaseModel):
+#     df_name: str
+#     n: int = 5  # Number of rows to preview
 
-@mcp.tool()
-def preview_dataframe(args: PreviewDataFrameArgs) -> list:
-    """Preview the first n rows of a DataFrame in memory."""
-    global _dataframes
-    df_name = args.df_name
-    n = args.n
-    if df_name not in _dataframes:
-        return [TextContent(type="text", text=f"DataFrame '{df_name}' not found. Available: {list(_dataframes.keys())}")]
-    df = _dataframes[df_name]
-    preview = df.head(n).to_string(index=False)
-    return [TextContent(type="text", text=f"Preview of '{df_name}' (first {n} rows):\n{preview}")]
+# @mcp.tool()
+# def preview_dataframe(args: PreviewDataFrameArgs) -> list:
+#     """Preview the first n rows of a DataFrame in memory."""
+#     global _dataframes
+#     df_name = args.df_name
+#     n = args.n
+#     if df_name not in _dataframes:
+#         return [TextContent(type="text", text=f"DataFrame '{df_name}' not found. Available: {list(_dataframes.keys())}")]
+#     df = _dataframes[df_name]
+#     preview = df.head(n).to_string(index=False)
+#     return [TextContent(type="text", text=f"Preview of '{df_name}' (first {n} rows):\n{preview}")]
 
 
 @mcp.tool()
