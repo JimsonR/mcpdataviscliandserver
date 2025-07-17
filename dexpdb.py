@@ -550,6 +550,7 @@ class CreateVisualizationArgs(BaseModel):
     bins: int = 20
     max_points: int = 100
 
+
 def _extract_plot_data(df, plot_type, x=None, y=None, column=None, title=None, bins=20, max_points=100, max_processing_rows=500000):
     """
     Extract plot data from DataFrame with intelligent sampling for large datasets.
@@ -1230,6 +1231,8 @@ def create_visualization(args: CreateVisualizationArgs) -> list:
         max_points=args.max_points
     )
     return [TextContent(type="text", text=json.dumps(plot_data, indent=2))]
+
+
 
 
 # Tool: List supported chart types
