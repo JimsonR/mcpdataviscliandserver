@@ -429,19 +429,24 @@ def get_notes() -> list:
 
 @mcp.tool()
 def run_script(args: RunScriptArgs) -> list:
-    """Execute a Python script with enhanced tracking and insights"""
+    """
+    Execute a Python script for in-memory DataFrame analysis (database context).
+    - All DataFrames are available as variables named after them (e.g., my_table = DataFrame).
+    - Do NOT use pd.read_csv(), workspace, memory, or environment dictionaries.
+    - DataFrames are loaded from the database using run_sql_query_enhanced, not from CSV.
+    - Use the save_to_memory argument to specify which variables to save to memory for later use.
+    """
     global _dataframes, _notes
-    # Your existing run_script implementation, but add exploration tracking
     if not hasattr(run_script, "_memory"):
         run_script._memory = {}
     memory = run_script._memory
     script = args.script
     save_to_memory = args.save_to_memory
-    # Basic validation
+    # Block CSV loading and clarify error
     if 'pd.read_csv(' in script:
-        return [TextContent(type="text", text="ERROR: Use list_dataframes to check the available dataframes instead of pd.read_csv()")]
+        return [TextContent(type="text", text="ERROR: DataFrames are loaded from the database, not CSV. Use run_sql_query_enhanced to load data.")]
     if any(pattern in script for pattern in ['import matplotlib', 'plt.show(', 'plt.figure(']):
-        return [TextContent(type="text", text="ERROR: Use DataFrame.plot() methods instead of matplotlib")]
+        return [TextContent(type="text", text="ERROR: Use DataFrame.plot() methods instead of matplotlib.")]
     # If script is a single variable name, try to return from memory
     if isinstance(script, str) and script.strip() in memory and (not ("\n" in script or ";" in script)):
         val = memory[script.strip()]
@@ -451,6 +456,7 @@ def run_script(args: RunScriptArgs) -> list:
     import sys
     import io
     import traceback
+    import sklearn
     local_vars = {**_dataframes, **memory}
     stdout = io.StringIO()
     sys_stdout = sys.stdout
@@ -491,15 +497,17 @@ def run_script(args: RunScriptArgs) -> list:
             if saved_vars:
                 _notes.append(f"Saved to memory: {', '.join(saved_vars)}")
         output_text = stdout.getvalue().strip()
-        if result is not None:
-            output = repr(result)
+        # --- Standardize output for all successful executions ---
+        if save_to_memory and saved_vars:
+            output = f"Script executed successfully. Saved to memory: {', '.join(saved_vars)}"
+        elif save_to_memory and not saved_vars:
+            output = "Script executed successfully. No variables were saved to memory."
+        elif result is not None:
+            output = f"Script executed successfully. Result: {repr(result)}"
         elif output_text:
-            output = output_text
+            output = f"Script executed successfully. Output: {output_text}"
         else:
-            if save_to_memory and saved_vars:
-                output = f"Script executed successfully. Saved to memory: {', '.join(saved_vars)}"
-            else:
-                output = "Script executed successfully (no output)"
+            output = "Script executed successfully (no output)"
     except Exception as e:
         tb = traceback.format_exc()
         output = f"Error: {str(e)}\n{tb}"
@@ -530,8 +538,6 @@ def list_dataframes() -> list:
     return [TextContent(type="text", text=result)]
 
 
-
-@mcp.tool()
 
 # --- Improved modular visualization tool ---
 class CreateVisualizationArgs(BaseModel):
@@ -1308,7 +1314,7 @@ You are a professional Data Scientist and SQL expert. You have access to a MySQL
    - Summarize your findings concisely.
 
 ## Important Guidelines:
-- Always use the tools (`list_db_tables`, `run_sql_query_enhanced`, `list_dataframes`, `create_visualization`) for all data access and analysis.
+- Always use the tools (`list_db_tables`, `run_sql_query_enhanced`, `list_dataframes`, `create_visualization`, `run_script`) for all data access and analysis.
 - Never access the database directly except through the provided tools.
 - Limit query result sizes to avoid large outputs (e.g., use LIMIT or aggregation).
 - If you are unsure about the schema, call `list_db_tables` first.
