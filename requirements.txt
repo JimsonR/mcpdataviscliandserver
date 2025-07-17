@@ -17,3 +17,4 @@ azure-storage-blob
 pyarrow
 pandas
 pymysql
+lux-api

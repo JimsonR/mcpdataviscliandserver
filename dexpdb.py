@@ -566,6 +566,139 @@ def _extract_plot_data(df, plot_type, x=None, y=None, column=None, title=None, b
     """
     global np
     import numpy as np
+        # --- Lux integration for automatic visualization suggestions ---
+    lux_enabled = False
+    try:
+        from lux.vis.Vis import Vis
+        from lux.vis.VisList import VisList
+        from lux.executor.PandasExecutor import PandasExecutor
+        lux_enabled = True
+    except ImportError:
+        lux_enabled = False
+
+    def lux_to_output(vis, plot_type, x, y, column, title, bins, max_points, original_size):
+        # Map Lux Vis object to the expected output structure
+        # Only handle bar, line, scatter, histogram, area, pie
+        if vis.mark == "bar":
+            # Bar: x=category, y=value
+            x_vals = vis.data[x].tolist() if x in vis.data else []
+            y_vals = vis.data[y].tolist() if y in vis.data else []
+            bars = []
+            for xv, yv in zip(x_vals, y_vals):
+                bars.append({"label": str(xv), "value": float(yv)})
+            return {
+                "type": "bar",
+                "bars": bars,
+                "title": title or vis.title or f"{y} by {x}",
+                "x": x,
+                "y": y,
+                "sampled": False,
+                "original_size": original_size
+            }
+        elif vis.mark == "line":
+            x_vals = vis.data[x].tolist() if x in vis.data else []
+            y_vals = vis.data[y].tolist() if y in vis.data else []
+            points = []
+            for xv, yv in zip(x_vals, y_vals):
+                points.append({"x": str(xv), "y": float(yv)})
+            return {
+                "type": "line",
+                "points": points,
+                "title": title or vis.title or f"{y} vs {x}",
+                "x": x,
+                "y": y,
+                "sampled": False,
+                "original_size": original_size
+            }
+        elif vis.mark == "scatter":
+            x_vals = vis.data[x].tolist() if x in vis.data else []
+            y_vals = vis.data[y].tolist() if y in vis.data else []
+            points = []
+            for xv, yv in zip(x_vals, y_vals):
+                points.append({"x": str(xv), "y": float(yv)})
+            return {
+                "type": "scatter",
+                "points": points,
+                "title": title or vis.title or f"Scatterplot of {y} vs {x}",
+                "x": x,
+                "y": y,
+                "sampled": False,
+                "original_size": original_size
+            }
+        elif vis.mark == "histogram":
+            # Lux histograms use a single column
+            col = x or y or column
+            if col and col in vis.data:
+                values = vis.data[col].dropna().tolist()
+                counts, bin_edges = np.histogram(values, bins=bins)
+                bins_out = [
+                    {"range": [float(bin_edges[i]), float(bin_edges[i+1])], "count": int(counts[i])}
+                    for i in range(len(counts))
+                ]
+                return {
+                    "type": "histogram",
+                    "bins": bins_out,
+                    "title": title or vis.title or f"Distribution of {col}",
+                    "column": col,
+                    "sampled": False,
+                    "original_size": original_size
+                }
+        elif vis.mark == "area":
+            # Area: treat as line with fill, similar to line output
+            x_vals = vis.data[x].tolist() if x in vis.data else []
+            y_vals = vis.data[y].tolist() if y in vis.data else []
+            points = []
+            for xv, yv in zip(x_vals, y_vals):
+                points.append({"x": str(xv), "y": float(yv)})
+            return {
+                "type": "area",
+                "series": {y: points},
+                "title": title or vis.title or f"Area chart of {y} by {x}",
+                "x": x,
+                "y": y,
+                "sampled": False,
+                "original_size": original_size
+            }
+        elif vis.mark == "pie":
+            # Pie: x=category, y=value
+            x_vals = vis.data[x].tolist() if x in vis.data else []
+            y_vals = vis.data[y].tolist() if y in vis.data else []
+            slices = []
+            for xv, yv in zip(x_vals, y_vals):
+                slices.append({"label": str(xv), "value": float(yv)})
+            return {
+                "type": "pie",
+                "slices": slices,
+                "title": title or vis.title or f"{y} by {x}",
+                "x": x,
+                "y": y,
+                "sampled": False,
+                "original_size": original_size
+            }
+        return None
+
+    # Try Lux if enabled and plot_type is supported
+    lux_supported = ["bar", "line", "scatter", "histogram", "area", "pie"]
+    if lux_enabled and plot_type in lux_supported and x and (y or plot_type == "histogram"):
+        try:
+            # Build Lux intent
+            intent = []
+            if plot_type == "histogram":
+                col = x or y or column
+                if col:
+                    intent = [col]
+            else:
+                intent = [x, y]
+            # Create Vis
+            vis = Vis(intent, df, mark=plot_type)
+            PandasExecutor.execute([vis], df)
+            # Only use if vis has data and matches expected columns
+            if vis.data is not None and not vis.data.empty:
+                out = lux_to_output(vis, plot_type, x, y, column, title, bins, max_points, len(df))
+                if out:
+                    return out
+        except Exception:
+            pass  # Fallback to existing logic if Lux fails
     import pandas as pd
     # Lower threshold for area/complex charts
     area_types = ["area", "heatmap"]
