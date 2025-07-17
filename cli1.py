@@ -271,12 +271,13 @@ def get_and_update_chat_history(chat_id: str, req_history: list, user_message: s
         chat_histories[chat_id] = []
     stored_history = chat_histories[chat_id]
     history = req_history
+    # If req_history is a list of structured entries, use it if longer
     if history is not None and len(history) > len(stored_history):
         chat_histories[chat_id] = history
         stored_history = history
     else:
         history = stored_history
-    # Append new messages if provided
+    # If user_message and assistant_message are provided, append as a simple message (legacy)
     if user_message is not None and assistant_message is not None:
         updated = (history or []) + [
             {"role": "user", "content": user_message},
@@ -566,9 +567,6 @@ async def llm_structured_agent(req: ChatRequest):
         messages.append(HumanMessage(content=req.message))
         # Use the enhanced invoke method
         result = await agent.invoke(messages)
-        # Update chat history if chat_id is used
-        if req.chat_id:
-            get_and_update_chat_history(req.chat_id, history, req.message, result.get("response"))
         # Extract reasoning steps for detailed breakdown
         reasoning_steps = result.get("reasoning_steps", [])
         # Format tool executions in the expected format (for backward compatibility)
@@ -580,7 +578,9 @@ async def llm_structured_agent(req: ChatRequest):
                     "arguments": tool_result["arguments"],
                     "result": tool_result["result"][:500] + "..." if len(str(tool_result["result"])) > 500 else tool_result["result"]
                 })
-        return {
+        # Build the full structured entry for this turn
+        structured_entry = {
+            "user_message": req.message,
             "response": result.get("response"),
             "formatted_output": result.get("formatted_output"),
             "reasoning_steps": reasoning_steps,
@@ -591,6 +591,12 @@ async def llm_structured_agent(req: ChatRequest):
             "error": False,
             "agent_type": "structured"
         }
+        # Update chat history if chat_id is used (append structured entry)
+        if req.chat_id:
+            if req.chat_id not in chat_histories:
+                chat_histories[req.chat_id] = []
+            chat_histories[req.chat_id].append(structured_entry)
+        return structured_entry
     except Exception as e:
         error_msg = str(e)
         print(f"Structured agent error: {error_msg}")
