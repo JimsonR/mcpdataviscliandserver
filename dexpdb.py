@@ -447,6 +447,7 @@ def run_script(args: RunScriptArgs) -> list:
         return [TextContent(type="text", text="ERROR: DataFrames are loaded from the database, not CSV. Use run_sql_query_enhanced to load data.")]
     if any(pattern in script for pattern in ['import matplotlib', 'plt.show(', 'plt.figure(']):
         return [TextContent(type="text", text="ERROR: Use DataFrame.plot() methods instead of matplotlib.")]
+    # Allow sklearn usage (imported below)
     # If script is a single variable name, try to return from memory
     if isinstance(script, str) and script.strip() in memory and (not ("\n" in script or ";" in script)):
         val = memory[script.strip()]
@@ -468,7 +469,7 @@ def run_script(args: RunScriptArgs) -> list:
         last_line = lines[-1] if lines else ""
         body = "\n".join(lines[:-1])
         exec_globals = globals().copy()
-        exec_globals.update({'pd': pd, 'np': np})
+        exec_globals.update({'pd': pd, 'np': np , 'sklearn': sklearn})
         sys.stdout = stdout
         if body.strip():
             exec(body, exec_globals, local_vars)
@@ -551,7 +552,7 @@ class CreateVisualizationArgs(BaseModel):
     max_points: int = 100
 
 
-def _extract_plot_data(df, plot_type, x=None, y=None, column=None, title=None, bins=20, max_points=100, max_processing_rows=500000):
+def _extract_plot_data(df, plot_type, x=None, y=None, column=None, title=None, bins=20, max_points=100, max_processing_rows=5000000):
     """
     Extract plot data from DataFrame with intelligent sampling for large datasets.
     
@@ -564,6 +565,8 @@ def _extract_plot_data(df, plot_type, x=None, y=None, column=None, title=None, b
         max_points: Maximum points in final output
         max_processing_rows: Maximum rows to process before sampling
     """
+    if df is None or not hasattr(df, "copy"):
+        return {"error": "DataFrame is not loaded or is empty."}
     global np
     import numpy as np
         # --- Lux integration for automatic visualization suggestions ---
