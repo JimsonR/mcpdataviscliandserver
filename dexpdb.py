@@ -573,6 +573,7 @@ def _extract_plot_data(df, plot_type, x=None, y=None, column=None, title=None, b
         from lux.vis.VisList import VisList
         from lux.executor.PandasExecutor import PandasExecutor
         lux_enabled = True
+        print("Lux import succeeded")
     except ImportError:
         lux_enabled = False
 
@@ -681,6 +682,8 @@ def _extract_plot_data(df, plot_type, x=None, y=None, column=None, title=None, b
     lux_supported = ["bar", "line", "scatter", "histogram", "area", "pie"]
     if lux_enabled and plot_type in lux_supported and x and (y or plot_type == "histogram"):
         try:
+            print("Using Lux for visualization extraction")  # Add this line
+
             # Build Lux intent
             intent = []
             if plot_type == "histogram":
@@ -1312,21 +1315,31 @@ def _extract_plot_data(df, plot_type, x=None, y=None, column=None, title=None, b
         return {"error": "Supported: histogram (column), line (column or x/y), bar (x, y), stacked_bar (x, y[list]), pie (column), area (x, y), scatter (x, y), heatmap (x, y), boxplot (y)"}
 
 @mcp.tool()
-def create_visualization(args: CreateVisualizationArgs) -> list:
+def create_visualization(args : CreateVisualizationArgs) -> list:
     """Create visualization data for React frontend.
     This tool extracts data for various chart types from a DataFrame.
-    Do list all supported chart types using list_supported_chart_types tool.
-    Do list_dataframes tool before using this tool to ensure you know the available DataFrames and their columns.
+    Accepts both {'args': {...}} and {...} argument formats for compatibility.
     """
     global _dataframes
-    df_name = args.df_name
+    # Accept both {'args': {...}} and {...} formats
+    if hasattr(args, 'dict'):
+        # Called with a Pydantic model (normal case)
+        args_dict = args.dict()
+    elif isinstance(args, dict) and 'args' in args and isinstance(args['args'], dict):
+        args_dict = args['args']
+    elif isinstance(args, dict):
+        args_dict = args
+    else:
+        return [TextContent(type="text", text="Error: Invalid arguments format for create_visualization.")]
+
+    df_name = args_dict.get('df_name')
     if df_name not in _dataframes:
         return [TextContent(type="text", text=f"DataFrame '{df_name}' not found. Available: {list(_dataframes.keys())}")]
     df = _dataframes[df_name]
-    plot_type = args.plot_type.lower() if isinstance(args.plot_type, str) else args.plot_type
-    # Validate and parse x/y for each chart type
-    x = args.x
-    y = args.y
+    plot_type = args_dict.get('plot_type')
+    plot_type = plot_type.lower() if isinstance(plot_type, str) else plot_type
+    x = args_dict.get('x')
+    y = args_dict.get('y')
     # Only allow y as list for certain chart types
     y_list_types = ["stacked_bar", "area"]
     x_list_types = []  # No chart type currently supports x as a list
@@ -1334,14 +1347,13 @@ def create_visualization(args: CreateVisualizationArgs) -> list:
         if isinstance(y, str) and "," in y:
             y = [col.strip() for col in y.split(",")]
     else:
-        # For all other chart types, y must be a string (single column)
         if isinstance(y, list):
             return [TextContent(type="text", text=f"Error: Chart type '{plot_type}' does not support multiple y columns.")]
         if isinstance(y, str) and "," in y:
             y_split = [col.strip() for col in y.split(",")]
             if len(y_split) > 1:
-                return [TextContent(type="text", text=f"Error: Chart type '{plot_type}' does not support multiple y columns.")]
-            y = y_split[0]
+                # Only use the first column for non-list types
+                y = y_split[0]
     if plot_type in x_list_types:
         if isinstance(x, str) and "," in x:
             x = [col.strip() for col in x.split(",")]
@@ -1351,17 +1363,16 @@ def create_visualization(args: CreateVisualizationArgs) -> list:
         if isinstance(x, str) and "," in x:
             x_split = [col.strip() for col in x.split(",")]
             if len(x_split) > 1:
-                return [TextContent(type="text", text=f"Error: Chart type '{plot_type}' does not support multiple x columns.")]
-            x = x_split[0]
+                x = x_split[0]
     plot_data = _extract_plot_data(
         df,
         plot_type,
         x=x,
         y=y,
-        column=args.column,
-        title=args.title,
-        bins=args.bins,
-        max_points=args.max_points
+        column=args_dict.get('column'),
+        title=args_dict.get('title'),
+        bins=args_dict.get('bins', 20),
+        max_points=args_dict.get('max_points', 100)
     )
     return [TextContent(type="text", text=json.dumps(plot_data, indent=2))]
 
