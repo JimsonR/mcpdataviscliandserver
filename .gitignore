@@ -4,3 +4,4 @@ License
 __pycache__
 **.parquet
 migrate.ipynb
+azuresqlintegrate.ipynb

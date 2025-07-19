@@ -1025,6 +1025,21 @@ async def quick_test():
         "message": "Server is responding quickly"
     }
 
+#-----------Token Usage Endpoint for Monitoring and Debugging-----------
+import tiktoken
+@app.get("/chat/token-usage/{chat_id}")
+def get_token_usage(chat_id: str):
+    history = chat_histories.get(chat_id, [])
+    # Choose the encoding for your model, e.g., "cl100k_base" for GPT-3.5/4
+    enc = tiktoken.get_encoding("cl100k_base")
+    total_tokens = 0
+    for msg in history:
+        content = msg.get("content", "")
+        total_tokens += len(enc.encode(content))
+    return {"chat_id": chat_id, "total_tokens": total_tokens, "message_count": len(history)}
+
+# --- Main entry point for running the FastAPI app ---
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("cli1:app", host="127.0.0.1", port=8080, reload=True)
