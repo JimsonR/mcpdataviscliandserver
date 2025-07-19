@@ -11,3 +11,6 @@ servers:
       - -m
       - mcp_simple_arxiv
     transport: stdio
+  azdbexp:
+    url: http://localhost:8005/mcp
+    transport: streamable_http
