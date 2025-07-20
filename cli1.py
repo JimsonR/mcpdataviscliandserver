@@ -1042,4 +1042,4 @@ def get_token_usage(chat_id: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("cli1:app", host="127.0.0.1", port=8080, reload=True)
+    uvicorn.run("cli1:app", host="0.0.0.0", port=8080, reload=True)

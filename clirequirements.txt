@@ -9,13 +9,3 @@ pyyaml
 langchain
 langchain-openai
 fastmcp
-dask[dataframe]
-polars
-numpy
-pandas
-azure-storage-blob
-pyarrow
-pandas
-pymysql
-lux-api
-pyodbc

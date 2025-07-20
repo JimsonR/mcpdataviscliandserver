@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 
 
-mcp = FastMCP(name="dsdb", host="127.0.0.1", port=8005)
+mcp = FastMCP(name="dsdb", host="0.0.0.0", port=8005)
 
 # In-memory data store for loaded DataFrames
 _dataframes = {}

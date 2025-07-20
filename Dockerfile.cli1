@@ -1,0 +1,30 @@
+FROM python:3.12-slim
+
+# Update system packages to reduce vulnerabilities
+RUN apt-get update && apt-get upgrade -y && apt-get clean
+
+# ...existing code...
+
+# Set working directory
+WORKDIR /app
+
+# Create a directory for scripts
+RUN mkdir -p agent
+
+# Copy cli1.py into the scripts directory
+COPY agent/custom_agent.py ./agent/
+
+
+
+# Copy requirements file and source code
+COPY clirequirements.txt ./
+COPY cli1.py ./
+
+# copy server yaml file
+COPY mcp_servers.yaml ./
+
+# Install dependencies
+RUN pip install --no-cache-dir -r clirequirements.txt
+
+EXPOSE 8080
+CMD ["python", "cli1.py"]
