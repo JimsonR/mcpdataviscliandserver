@@ -11,6 +11,12 @@ import asyncio
 from langgraph.prebuilt import create_react_agent
 import yaml
 from threading import Lock
+from sessions.redis_backend import (
+    get_chat_history,
+    save_chat_history,
+    delete_chat_session,
+    list_chat_sessions
+)
 
 from agent.custom_agent import StructuredAgent
 
@@ -165,36 +171,57 @@ class ChatRequest(BaseModel):
     history: Optional[List[dict]] = None  # Each dict: {"role": "user"/"assistant", "content": "..."}
     chat_id: Optional[str] = None  # For tabbed chat
 
-# --- Chat session management endpoints ---
+# --- Chat session management endpoints  internal ---
+
+
+# @app.post("/chat/create-session")
+# def create_chat_session():
+#     chat_id = str(uuid4())
+#     chat_histories[chat_id] = []
+#     return {"chat_id": chat_id}
+
+# @app.get("/chat/list-sessions")
+# def list_chat_sessions():
+#     return {"chat_ids": list(chat_histories.keys())}
+
+# @app.get("/chat/get-history/{chat_id}")
+# def get_chat_history(chat_id: str):
+#     return {"chat_id": chat_id, "history": chat_histories.get(chat_id, [])}
+
+# @app.delete("/chat/delete-session/{chat_id}")
+# def delete_chat_session(chat_id: str):
+#     if chat_id in chat_histories:
+#         del chat_histories[chat_id]
+#         return {"deleted": True, "chat_id": chat_id}
+#     return {"deleted": False, "chat_id": chat_id, "error": "Not found"}
+
+
+# @app.post("/mcp/call-tool")
+# async def call_mcp_tool(server: str, tool_name: str, arguments: dict):
+#     server_cfg = get_server_cfg(server)
+#     async with get_server_client(server_cfg) as client:
+#         result = await client.call_tool(tool_name, arguments)
+#         return result
+
+#----------chat session management endpoints using redis backend for persistence
 @app.post("/chat/create-session")
 def create_chat_session():
     chat_id = str(uuid4())
-    chat_histories[chat_id] = []
+    save_chat_history(chat_id, [])
     return {"chat_id": chat_id}
 
 @app.get("/chat/list-sessions")
-def list_chat_sessions():
-    return {"chat_ids": list(chat_histories.keys())}
+def list_chat_sessions_endpoint():
+    return {"chat_ids": list_chat_sessions()}
 
 @app.get("/chat/get-history/{chat_id}")
-def get_chat_history(chat_id: str):
-    return {"chat_id": chat_id, "history": chat_histories.get(chat_id, [])}
+def get_chat_history_endpoint(chat_id: str):
+    return {"chat_id": chat_id, "history": get_chat_history(chat_id)}
 
 @app.delete("/chat/delete-session/{chat_id}")
-def delete_chat_session(chat_id: str):
-    if chat_id in chat_histories:
-        del chat_histories[chat_id]
-        return {"deleted": True, "chat_id": chat_id}
-    return {"deleted": False, "chat_id": chat_id, "error": "Not found"}
-
-
-@app.post("/mcp/call-tool")
-async def call_mcp_tool(server: str, tool_name: str, arguments: dict):
-    server_cfg = get_server_cfg(server)
-    async with get_server_client(server_cfg) as client:
-        result = await client.call_tool(tool_name, arguments)
-        return result
-
+def delete_chat_session_endpoint(chat_id: str):
+    delete_chat_session(chat_id)
+    return {"deleted": True, "chat_id": chat_id}
 
 # --- Optimized: Only check reachable servers on demand, not on every frontend load ---
 

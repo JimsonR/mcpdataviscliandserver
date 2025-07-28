@@ -9,3 +9,4 @@ pyyaml
 langchain
 langchain-openai
 fastmcp
+redis
