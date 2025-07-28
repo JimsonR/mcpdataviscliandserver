@@ -14,6 +14,9 @@ RUN mkdir -p agent
 # Copy cli1.py into the scripts directory
 COPY agent/custom_agent.py ./agent/
 
+# Copy session python file
+COPY sessions/redis_backend.py ./sessions/
+
 
 
 # Copy requirements file and source code
