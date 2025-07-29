@@ -196,12 +196,12 @@ class ChatRequest(BaseModel):
 #     return {"deleted": False, "chat_id": chat_id, "error": "Not found"}
 
 
-# @app.post("/mcp/call-tool")
-# async def call_mcp_tool(server: str, tool_name: str, arguments: dict):
-#     server_cfg = get_server_cfg(server)
-#     async with get_server_client(server_cfg) as client:
-#         result = await client.call_tool(tool_name, arguments)
-#         return result
+@app.post("/mcp/call-tool")
+async def call_mcp_tool(server: str, tool_name: str, arguments: dict):
+    server_cfg = get_server_cfg(server)
+    async with get_server_client(server_cfg) as client:
+        result = await client.call_tool(tool_name, arguments)
+        return result
 
 #----------chat session management endpoints using redis backend for persistence
 @app.post("/chat/create-session")
@@ -287,30 +287,48 @@ from langchain_core.messages import AIMessage
 
 
 # --- Shared chat history management function ---
+# def get_and_update_chat_history(chat_id: str, req_history: list, user_message: str = None, assistant_message: str = None):
+#     """
+#     Retrieve and update chat history for a given chat_id.
+#     - If req_history is provided and longer than stored, use it.
+#     - Always append user_message and assistant_message if provided.
+#     Returns the updated history.
+#     """
+#     if chat_id not in chat_histories:
+#         chat_histories[chat_id] = []
+#     stored_history = chat_histories[chat_id]
+#     history = req_history
+#     # If req_history is a list of structured entries, use it if longer
+#     if history is not None and len(history) > len(stored_history):
+#         chat_histories[chat_id] = history
+#         stored_history = history
+#     else:
+#         history = stored_history
+#     # If user_message and assistant_message are provided, append as a simple message (legacy)
+#     if user_message is not None and assistant_message is not None:
+#         updated = (history or []) + [
+#             {"role": "user", "content": user_message},
+#             {"role": "assistant", "content": assistant_message}
+#         ]
+#         chat_histories[chat_id] = updated
+#         return updated
+#     return history or []
+
+#------------Redis-based chat history management function
 def get_and_update_chat_history(chat_id: str, req_history: list, user_message: str = None, assistant_message: str = None):
-    """
-    Retrieve and update chat history for a given chat_id.
-    - If req_history is provided and longer than stored, use it.
-    - Always append user_message and assistant_message if provided.
-    Returns the updated history.
-    """
-    if chat_id not in chat_histories:
-        chat_histories[chat_id] = []
-    stored_history = chat_histories[chat_id]
+    stored_history = get_chat_history(chat_id)
     history = req_history
-    # If req_history is a list of structured entries, use it if longer
     if history is not None and len(history) > len(stored_history):
-        chat_histories[chat_id] = history
+        save_chat_history(chat_id, history)
         stored_history = history
     else:
         history = stored_history
-    # If user_message and assistant_message are provided, append as a simple message (legacy)
     if user_message is not None and assistant_message is not None:
         updated = (history or []) + [
             {"role": "user", "content": user_message},
             {"role": "assistant", "content": assistant_message}
         ]
-        chat_histories[chat_id] = updated
+        save_chat_history(chat_id, updated)
         return updated
     return history or []
 
@@ -619,10 +637,14 @@ async def llm_structured_agent(req: ChatRequest):
             "agent_type": "structured"
         }
         # Update chat history if chat_id is used (append structured entry)
+        # if req.chat_id:
+        #     if req.chat_id not in chat_histories:
+        #         chat_histories[req.chat_id] = []
+        #     chat_histories[req.chat_id].append(structured_entry)
         if req.chat_id:
-            if req.chat_id not in chat_histories:
-                chat_histories[req.chat_id] = []
-            chat_histories[req.chat_id].append(structured_entry)
+            history = get_chat_history(req.chat_id)
+            history.append(structured_entry)
+            save_chat_history(req.chat_id, history)
         return structured_entry
     except Exception as e:
         error_msg = str(e)
@@ -1056,7 +1078,8 @@ async def quick_test():
 import tiktoken
 @app.get("/chat/token-usage/{chat_id}")
 def get_token_usage(chat_id: str):
-    history = chat_histories.get(chat_id, [])
+    history = get_chat_history(chat_id)
+    # history = chat_histories.get(chat_id, [])
     # Choose the encoding for your model, e.g., "cl100k_base" for GPT-3.5/4
     enc = tiktoken.get_encoding("cl100k_base")
     total_tokens = 0
