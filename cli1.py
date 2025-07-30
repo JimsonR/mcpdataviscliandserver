@@ -1088,6 +1088,45 @@ def get_token_usage(chat_id: str):
         total_tokens += len(enc.encode(content))
     return {"chat_id": chat_id, "total_tokens": total_tokens, "message_count": len(history)}
 
+# @app.get("/llm/model-info")
+# def get_llm_model_info():
+#     # Try common attributes for model name
+#     model_name = getattr(llm, "deployment_name", None) or getattr(llm, "model_name", None)
+#     return {
+#         "model_name": model_name,
+#         "type": type(llm).__name__
+#     }
+
+@app.get("/llm/max-tokens")
+def get_llm_max_tokens():
+    # Try to get max tokens from the LLM object
+    model_name = getattr(llm, "deployment_name", None) or getattr(llm, "model_name", None)
+
+    return {"max_tokens": LLM_MAX_TOKENS.get(model_name, None), "model_name": model_name}
+
+
+# Example: LLM model names and their max token limits
+LLM_MAX_TOKENS = {
+    "gpt-3.5-turbo": 4096,
+    "gpt-3.5-turbo-16k": 16384,
+    "gpt-4": 8192,
+    "gpt-4-32k": 32768,
+    "gpt-4-1106-preview": 128000,
+    "gpt-4-turbo": 128000,
+    "mistral-7b": 32768,
+    "mistral-medium": 32768,
+    "qwen-qwq-32b": 32768,
+    "llama-2-70b": 4096,
+    "llama-3-70b": 8192,
+    "mixtral-8x7b": 32768,
+    "claude-2": 100000,
+    "claude-3-opus": 200000,
+    "claude-3-sonnet": 200000,
+    "claude-3-haiku": 200000,
+    "gpt-4o": 128000,
+    # Add more as needed
+}
+
 # --- Main entry point for running the FastAPI app ---
 
 if __name__ == "__main__":
