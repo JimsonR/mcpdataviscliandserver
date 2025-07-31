@@ -1416,8 +1416,29 @@ def list_supported_chart_types() -> list:
 ### Data Exploration Tools Description & Schema
 _dataframes: Dict[str, pd.DataFrame] = {}
 
+
 # --- Table preview resource pattern ---
 _last_table_preview = None  # Global cache for last prepared table preview
+
+# --- Sample prompts for data exploration ---
+SAMPLE_PROMPTS = [
+    "What are the total sales by year or by territory?",
+    "Who are the top 10 customers by total purchase amount?",
+    "What is the trend of sales over the last three years?",
+    "Which products have the highest sales volume?",
+    "What are the most common reasons for sales (from SalesReason)?",
+    "How do sales quotas compare to actual sales for each salesperson?",
+    "What is the average order value per customer?",
+    "Which territories have the highest and lowest sales?",
+    "What is the distribution of payment methods (CreditCard types) used?",
+    "How many new customers were acquired each year?"
+]
+# Resource: DataFrame schema and preview
+@mcp.resource("data-exploration://sample-prompts", mime_type="application/json")
+def sample_prompts_resource():
+    """Return a list of sample prompts for data exploration."""
+    print("[RESOURCE] sample_prompts_resource called")
+    return SAMPLE_PROMPTS
 
 
 class PrepareTableResourceArgs(BaseModel):
@@ -1452,7 +1473,9 @@ def table_preview_resource():
     return _last_table_preview
 
 
-### Prompt templates
+# -----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+#                                                              Sample Prompt Templates for data exploration
+# -----------------------------------------------------------------------------------------------------------------------------------------------------------------------
 class DataExplorationPrompts(str, Enum):
     EXPLORE_DATA = "explore-data"
 
@@ -1490,6 +1513,10 @@ def explore_data_prompt():
     """A prompt to explore a  database as a data scientist"""
     print("Registering explore_data_prompt")
     return DB_PROMPT_TEMPLATE
+
+
+
+
 
 
 # Resource: DataFrame schema and preview
