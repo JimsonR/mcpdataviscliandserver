@@ -1268,19 +1268,22 @@ async def llm_structured_agent_stream(req: ChatRequest):
         async def structured_agent_stream():
             try:
                 step_count = 0
+                last_thought_content = ""  # Track last thinking content for deduplication
                 
                 async for step in agent.astream(messages):
                     if step["type"] == "thought":
                         step_count += 1
+                        thought_content = step['content']
+                        last_thought_content = thought_content.strip()  # Store for comparison
                         # Raw output with tags for frontend formatting
-                        yield json.dumps({"type": "content", "data": f"<thought>{step['content']}</thought>"}) + "\n"
+                        yield json.dumps({"type": "content", "data": f"<thought>{thought_content}</thought>"}) + "\n"
                     
                     elif step["type"] == "tool_execution":
                         # Wrap all tool-related parts under one tag for frontend rendering
                         tool_name = step.get('tool_name', 'Unknown Tool')
                         
                         # Start tool use wrapper
-                        yield json.dumps({"type": "content", "data": f"<tool_use>"}) + "\n"
+                        yield json.dumps({"type": "content", "data": f"<tool_use> {tool_name}"}) + "\n"
                         yield json.dumps({"type": "content", "data": f"<action>{tool_name}</action>"}) + "\n"
                         
                         # Tool arguments if present
@@ -1299,8 +1302,32 @@ async def llm_structured_agent_stream(req: ChatRequest):
                     
                     elif step["type"] == "final_answer":
                         if step.get("content"):
-                            # Raw output with tags for frontend formatting
-                            yield json.dumps({"type": "content", "data": f"<final_answer>{step['content']}</final_answer>"}) + "\n"
+                            final_content = step['content'].strip()
+                            # Check for substantial similarity with last thinking content
+                            # Skip if final answer is very similar to the last thought
+                            similarity_threshold = 0.8  # 80% similarity threshold
+                            if last_thought_content and final_content:
+                                # Simple similarity check: compare normalized content
+                                final_normalized = ' '.join(final_content.lower().split())
+                                thought_normalized = ' '.join(last_thought_content.lower().split())
+                                
+                                # Calculate similarity based on common words
+                                final_words = set(final_normalized.split())
+                                thought_words = set(thought_normalized.split())
+                                
+                                if final_words and thought_words:
+                                    common_words = final_words.intersection(thought_words)
+                                    similarity = len(common_words) / max(len(final_words), len(thought_words))
+                                    
+                                    # Only output final answer if it's sufficiently different
+                                    if similarity < similarity_threshold:
+                                        yield json.dumps({"type": "content", "data": f"<final_answer>{final_content}</final_answer>"}) + "\n"
+                                else:
+                                    # If one is empty, output the final answer
+                                    yield json.dumps({"type": "content", "data": f"<final_answer>{final_content}</final_answer>"}) + "\n"
+                            else:
+                                # No previous thought or empty content, output final answer
+                                yield json.dumps({"type": "content", "data": f"<final_answer>{final_content}</final_answer>"}) + "\n"
                     
                     # Small delay between chunks for proper streaming
                     await asyncio.sleep(0.01)
