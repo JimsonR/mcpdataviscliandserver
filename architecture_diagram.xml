@@ -1,0 +1,134 @@
+<mxfile host="app.diagrams.net" modified="2025-01-29T10:00:00.000Z" agent="5.0" version="24.0.0" etag="ARCH123">
+  <diagram name="MCP Project - Current Working Architecture" id="architecture">
+    <mxGraphModel dx="1422" dy="794" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1200" pageHeight="900" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        
+        <!-- Title -->
+        <mxCell id="title" value="MCP Project - Active Components Architecture" style="text;fontSize=24;fontStyle=1;fontColor=#1565C0;align=center;" vertex="1" parent="1">
+          <mxGeometry x="300" y="20" width="500" height="40" as="geometry" />
+        </mxCell>
+        
+        <!-- Frontend Client -->
+        <mxCell id="frontend" value="Frontend Client&#xa;React App" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#1976D2;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="50" y="100" width="150" height="60" as="geometry" />
+        </mxCell>
+        
+        <!-- FastAPI Backend -->
+        <mxCell id="backend" value="FastAPI Backend&#xa;(cli1.py)&#xa;&#xa;• Chat endpoints&#xa;• Session management&#xa;• Agent orchestration" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E8;strokeColor=#4CAF50;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="280" y="80" width="180" height="100" as="geometry" />
+        </mxCell>
+        
+        <!-- Azure OpenAI -->
+        <mxCell id="azure-openai" value="Azure OpenAI&#xa;GPT-4 / GPT-3.5&#xa;Chat Completions" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF8E1;strokeColor=#FF9800;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="50" y="220" width="150" height="80" as="geometry" />
+        </mxCell>
+        
+        <!-- Custom Agent -->
+        <mxCell id="custom-agent" value="Custom Agent&#xa;(agent/custom_agent.py)&#xa;&#xa;StructuredAgent:&#xa;• Enhanced reasoning&#xa;• Tool execution&#xa;• Claude-like formatting&#xa;• Response structuring" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E5F5;strokeColor=#9C27B0;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="280" y="220" width="180" height="120" as="geometry" />
+        </mxCell>
+        
+        <!-- MCP Client -->
+        <mxCell id="mcp-client" value="MultiServerMCPClient&#xa;(LangChain MCP Adapter)&#xa;&#xa;• Tool discovery&#xa;• Server health check&#xa;• Request routing&#xa;• Tool execution" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F8E6FF;strokeColor=#9C27B0;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="520" y="200" width="200" height="100" as="geometry" />
+        </mxCell>
+        
+        <!-- MCP Server Config -->
+        <mxCell id="mcp-config" value="MCP Server Config&#xa;mcp_servers.yaml&#xa;&#xa;servers:&#xa;  azdbexp:&#xa;    transport: streamable_http&#xa;    url: http://localhost:8005/mcp" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFECB3;strokeColor=#FF9800;fontStyle=1;align=left;" vertex="1" parent="1">
+          <mxGeometry x="520" y="80" width="250" height="100" as="geometry" />
+        </mxCell>
+        
+        <!-- Azure SQL Data Explorer MCP Server -->
+        <mxCell id="azdbexp-server" value="Azure SQL Data Explorer MCP Server&#xa;(azdbexp.py - Port 8005)&#xa;&#xa;FastMCP Server with tools:&#xa;• run_sql_query_enhanced&#xa;• explore_data_patterns&#xa;• create_visualization&#xa;• test_hypothesis&#xa;• list_db_tables&#xa;• run_script&#xa;• get_exploration_history" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFEBEE;strokeColor=#F44336;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="800" y="150" width="280" height="160" as="geometry" />
+        </mxCell>
+        
+        <!-- Azure SQL Database -->
+        <mxCell id="azure-sql" value="Azure SQL Database&#xa;AdventureWorks2022&#xa;&#xa;Tables:&#xa;• Sales data&#xa;• Customer data&#xa;• Product catalog&#xa;• Territory info" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1F5FE;strokeColor=#0277BD;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="800" y="350" width="200" height="120" as="geometry" />
+        </mxCell>
+        
+        <!-- Redis Backend -->
+        <mxCell id="redis-cache" value="Redis Backend&#xa;(sessions/redis_backend.py)&#xa;&#xa;• Chat history storage&#xa;• Session persistence&#xa;• get_chat_history()&#xa;• save_chat_history()" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E1F5FE;strokeColor=#0277BD;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="50" y="350" width="200" height="120" as="geometry" />
+        </mxCell>
+        
+        <!-- Main Data Flow -->
+        <mxCell id="flow-box" value="CURRENT MCP DATA FLOW&#xa;&#xa;1. Frontend sends request to FastAPI&#xa;2. FastAPI routes to Custom Agent&#xa;3. Agent decides to use MCP tools&#xa;4. MCP Client routes to azdbexp server&#xa;5. azdbexp executes SQL on Azure DB&#xa;6. Results flow back through chain&#xa;7. Agent formats structured response&#xa;8. Response saved to Redis (if chat_id)&#xa;9. Final JSON returned to Frontend" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F0F4C3;strokeColor=#827717;fontStyle=0;align=left;verticalAlign=top;" vertex="1" parent="1">
+          <mxGeometry x="50" y="520" width="350" height="200" as="geometry" />
+        </mxCell>
+        
+        <!-- Available Tools -->
+        <mxCell id="tools-box" value="AZDBEXP MCP TOOLS&#xa;&#xa;SQL Operations:&#xa;• run_sql_query_enhanced - Execute SQL with insights&#xa;• list_db_tables - Show schema&#xa;&#xa;Data Exploration:&#xa;• explore_data_patterns - Quality, relationships, anomalies&#xa;• test_hypothesis - Data hypothesis testing&#xa;• get_exploration_history - Track analysis steps&#xa;&#xa;Visualization:&#xa;• create_visualization - Generate chart data&#xa;• prepare_table_resource - CSV previews&#xa;&#xa;Analysis:&#xa;• run_script - Execute Python on DataFrames&#xa;• list_dataframes - Show loaded data" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F5E8;strokeColor=#4CAF50;fontStyle=0;align=left;verticalAlign=top;" vertex="1" parent="1">
+          <mxGeometry x="450" y="520" width="300" height="200" as="geometry" />
+        </mxCell>
+        
+        <!-- Key Components -->
+        <mxCell id="components-box" value="ACTIVE COMPONENTS&#xa;&#xa;✓ FastAPI Backend (cli1.py)&#xa;✓ Custom Agent (StructuredAgent)&#xa;✓ MCP Client (MultiServerMCPClient)&#xa;✓ Azure SQL Explorer (azdbexp.py)&#xa;✓ Redis Session Storage&#xa;✓ Azure SQL Database&#xa;&#xa;Current Configuration:&#xa;• 1 MCP Server running (azdbexp)&#xa;• Port 8005 - streamable_http&#xa;• Direct SQL access to Azure DB&#xa;• Enhanced data exploration tools&#xa;• Structured agent responses" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF8E1;strokeColor=#F57C00;fontStyle=0;align=left;verticalAlign=top;" vertex="1" parent="1">
+          <mxGeometry x="800" y="520" width="280" height="200" as="geometry" />
+        </mxCell>
+        
+        
+        <!-- Arrows showing main data flow -->
+        <mxCell id="arrow1" value="HTTP/REST" style="endArrow=classic;html=1;strokeWidth=3;strokeColor=#1976D2;fontStyle=1;" edge="1" parent="1" source="frontend" target="backend">
+          <mxGeometry width="50" height="50" relative="1" as="geometry">
+            <mxPoint x="200" y="130" as="sourcePoint" />
+            <mxPoint x="280" y="130" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        
+        <mxCell id="arrow2" value="LLM Calls" style="endArrow=classic;html=1;strokeWidth=2;strokeColor=#FF9800;fontStyle=1;" edge="1" parent="1" source="backend" target="azure-openai">
+          <mxGeometry width="50" height="50" relative="1" as="geometry">
+            <mxPoint x="280" y="180" as="sourcePoint" />
+            <mxPoint x="200" y="220" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        
+        <mxCell id="arrow3" value="Agent&#xa;Orchestration" style="endArrow=classic;html=1;strokeWidth=3;strokeColor=#9C27B0;fontStyle=1;" edge="1" parent="1" source="backend" target="custom-agent">
+          <mxGeometry width="50" height="50" relative="1" as="geometry">
+            <mxPoint x="370" y="180" as="sourcePoint" />
+            <mxPoint x="370" y="220" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        
+        <mxCell id="arrow4" value="Tool&#xa;Execution" style="endArrow=classic;html=1;strokeWidth=3;strokeColor=#9C27B0;fontStyle=1;" edge="1" parent="1" source="custom-agent" target="mcp-client">
+          <mxGeometry width="50" height="50" relative="1" as="geometry">
+            <mxPoint x="460" y="260" as="sourcePoint" />
+            <mxPoint x="520" y="260" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        
+        <mxCell id="arrow5" value="Server&#xa;Routing" style="endArrow=classic;html=1;strokeWidth=3;strokeColor=#F44336;fontStyle=1;" edge="1" parent="1" source="mcp-client" target="azdbexp-server">
+          <mxGeometry width="50" height="50" relative="1" as="geometry">
+            <mxPoint x="720" y="250" as="sourcePoint" />
+            <mxPoint x="800" y="230" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        
+        <mxCell id="arrow6" value="SQL&#xa;Queries" style="endArrow=classic;html=1;strokeWidth=3;strokeColor=#0277BD;fontStyle=1;" edge="1" parent="1" source="azdbexp-server" target="azure-sql">
+          <mxGeometry width="50" height="50" relative="1" as="geometry">
+            <mxPoint x="940" y="310" as="sourcePoint" />
+            <mxPoint x="900" y="350" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        
+        <mxCell id="arrow7" value="Session&#xa;Storage" style="endArrow=classic;html=1;strokeWidth=2;strokeColor=#0277BD;fontStyle=1;" edge="1" parent="1" source="backend" target="redis-cache">
+          <mxGeometry width="50" height="50" relative="1" as="geometry">
+            <mxPoint x="280" y="180" as="sourcePoint" />
+            <mxPoint x="200" y="350" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        
+        <mxCell id="arrow8" value="Config&#xa;Loading" style="endArrow=classic;html=1;strokeWidth=2;strokeColor=#FF9800;fontStyle=1;" edge="1" parent="1" source="mcp-config" target="mcp-client">
+          <mxGeometry width="50" height="50" relative="1" as="geometry">
+            <mxPoint x="620" y="180" as="sourcePoint" />
+            <mxPoint x="620" y="200" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

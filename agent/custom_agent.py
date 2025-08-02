@@ -529,6 +529,90 @@ class StructuredAgent:
             "formatted_output": self._format_structured_response(reasoning_steps, final_response)
         }
 
+    async def astream(self, input: Union[str, List[BaseMessage]]):
+        """Stream the agent execution, yielding intermediate steps with structured formatting"""
+        import json
+        
+        # Initialize state
+        if isinstance(input, str):
+            messages = [HumanMessage(content=input)]
+        else:
+            messages = input.copy()
+        
+        iterations = 0
+        reasoning_steps = []
+        
+        # Main loop with streaming
+        while iterations < self.max_iterations:
+            iterations += 1
+            
+            # Generate AI response (with tool binding)
+            llm_with_tools = self.llm.bind_tools(list(self.tools.values()))
+            ai_message = await llm_with_tools.ainvoke(messages)
+            messages.append(ai_message)
+            
+            # Process the AI response with reasoning
+            step_info = self._process_ai_response(ai_message, iterations)
+            reasoning_steps.append(step_info)
+            
+            # Yield the thinking step if there's reasoning content using structured tags
+            if step_info['reasoning'] and step_info['reasoning'].strip():
+                yield {
+                    "type": "thought",
+                    "iteration": iterations,
+                    "content": step_info['reasoning'].strip()
+                }
+            
+            # Extract tool calls if any
+            if not hasattr(ai_message, 'tool_calls') or not ai_message.tool_calls:
+                # No more tool calls, yield final response
+                final_response = ai_message.content
+                yield {
+                    "type": "final_answer",
+                    "content": final_response,
+                    "iterations": iterations
+                }
+                break
+                
+            # Execute all tool calls and update the step info
+            tool_messages = await self._execute_tools(ai_message.tool_calls)
+            messages.extend(tool_messages)
+            
+            # Update step with tool results and yield structured tool executions
+            tool_results = self._format_tool_results(ai_message.tool_calls, tool_messages)
+            step_info['tool_results'] = tool_results
+            
+            # Use structured formatting for tool executions
+            for tool_call in step_info['tool_calls']:
+                tool_name = tool_call['name']
+                args = tool_call['args']
+                args_json = json.dumps(args, sort_keys=True, ensure_ascii=False)
+                
+                # Find corresponding result
+                result = None
+                for tool_result in tool_results:
+                    if (tool_result['tool_name'] == tool_name and 
+                        json.dumps(tool_result['arguments'], sort_keys=True, ensure_ascii=False) == args_json):
+                        result = tool_result['result']
+                        break
+                
+                # Yield action
+                yield {
+                    "type": "tool_execution",
+                    "iteration": iterations,
+                    "tool_name": tool_name,
+                    "arguments": args,
+                    "result": result
+                }
+        
+        # If we exit the loop without a final answer, yield a timeout message
+        if iterations >= self.max_iterations:
+            yield {
+                "type": "final_answer", 
+                "content": f"Stopped after {iterations} iterations",
+                "iterations": iterations
+            }
+
     def _process_ai_response(self, ai_message: AIMessage, iteration: int) -> Dict[str, Any]:
         """Process AI response and extract reasoning + tool calls"""
         step_info = {
@@ -656,20 +740,13 @@ class StructuredAgent:
                         'arguments': tool_call['args'],
                         'tool_call_id': tool_call['id']
                     }
-                    
                     # Find corresponding tool result
                     for tool_msg in messages:
                         if (isinstance(tool_msg, ToolMessage) and 
                             tool_msg.tool_call_id == tool_call['id']):
-                            execution['result'] = (
-                                tool_msg.content[:500] + '...' 
-                                if len(tool_msg.content) > 500 
-                                else tool_msg.content
-                            )
+                            execution['result'] = tool_msg.content
                             break
-                    
                     executions.append(execution)
-        
         return executions
 
     def get_conversation_summary(self) -> str:

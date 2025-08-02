@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException
+import datetime
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastmcp import Client
 from langchain_openai import AzureChatOpenAI
@@ -8,6 +9,10 @@ from dotenv import load_dotenv
 from pydantic import BaseModel
 import os
 import asyncio
+
+import json
+from fastapi.responses import StreamingResponse
+
 from langgraph.prebuilt import create_react_agent
 import yaml
 from threading import Lock
@@ -18,7 +23,9 @@ from sessions.redis_backend import (
     list_chat_sessions
 )
 
+
 from agent.custom_agent import StructuredAgent
+import types
 
 
 load_dotenv(".env")
@@ -356,6 +363,254 @@ async def llm_chat(req: ChatRequest):
     return {"response": response.content, "chat_id": req.chat_id}
 
 
+# -------------------------------------------------------------------------------------------------------------------------------------#
+#                                           Streaming endpoint for LLM/agent responses                                                 #
+#--------------------------------------------------------------------------------------------------------------------------------------#
+@app.post("/llm/agent-stream")
+async def llm_agent_stream(req: ChatRequest):
+    """
+    Streaming endpoint for agent responses. Streams reasoning/response in real time.
+    """
+    servers = get_mcp_servers()
+    if not servers:
+        async def error_stream():
+            yield "No MCP servers configured.\n"
+        return StreamingResponse(error_stream(), media_type="text/plain")
+    try:
+        reachable_servers = await get_reachable_servers(servers, skip_health_check=False)
+        if not reachable_servers:
+            async def error_stream():
+                yield "No MCP servers are currently reachable.\n"
+            return StreamingResponse(error_stream(), media_type="text/plain")
+        # --- Ensure all MCP server connections are initialized before streaming ---
+        client = MultiServerMCPClient(reachable_servers)
+        # Do not proactively initialize all server connections; let agent/tool invocation handle it (as in non-streaming endpoints)
+        tools = await client.get_tools()
+        if not tools:
+            async def error_stream():
+                yield "No tools available from reachable MCP servers.\n"
+            return StreamingResponse(error_stream(), media_type="text/plain")
+        agent = create_react_agent(llm, tools)
+        # --- Use shared chat history logic ---
+        history = req.history
+        if req.chat_id:
+            history = get_and_update_chat_history(req.chat_id, req.history)
+        # Limit history to last 10 messages to prevent context overflow
+        recent_history = history[-10:] if history and len(history) > 10 else history
+        messages = []
+        if recent_history:
+            for m in recent_history:
+                if m["role"] == "user":
+                    messages.append(HumanMessage(content=m["content"]))
+                elif m["role"] == "assistant":
+                    messages.append(AIMessage(content=m["content"]))
+        messages.append(HumanMessage(content=req.message))
+
+        import logging
+        import traceback
+        import sys
+        def format_exception_recursive(exc, prefix=""):  # Helper for streaming all sub-exceptions
+            import types
+            lines = []
+            # Print the main exception
+            lines.append(f"{prefix}[Error] {type(exc).__name__}: {exc}")
+            tb = traceback.format_exception(type(exc), exc, exc.__traceback__)
+            lines.extend([prefix + l.rstrip() for l in tb])
+            # Python 3.11+ ExceptionGroup/BaseExceptionGroup
+            if hasattr(exc, 'exceptions') and isinstance(exc, BaseException):
+                for idx, sub in enumerate(getattr(exc, 'exceptions', [])):
+                    lines.append(f"{prefix}--- Sub-exception {idx+1} ---")
+                    lines.extend(format_exception_recursive(sub, prefix + "    "))
+            # Python <3.11: check __cause__ and __context__
+            if getattr(exc, '__cause__', None):
+                lines.append(f"{prefix}Caused by:")
+                lines.extend(format_exception_recursive(exc.__cause__, prefix + "    "))
+            if getattr(exc, '__context__', None):
+                lines.append(f"{prefix}During handling of the above exception, another exception occurred:")
+                lines.extend(format_exception_recursive(exc.__context__, prefix + "    "))
+            return lines
+
+        import json
+
+        async def agent_stream():
+            chunk_count = 0
+            content_count = 0
+            try:
+                print(f"[DEBUG] Starting agent.astream...")
+                # Track the agent's execution state
+                current_thought = ""
+                current_action = ""
+                current_input = ""
+                async for chunk in agent.astream({"messages": messages}, config={"recursion_limit": 30, "max_execution_time": 30}):
+                    chunk_count += 1
+                    print(f"[DEBUG] Chunk {chunk_count}: type={type(chunk)}")
+                    print(f"[DEBUG] Chunk {chunk_count}: {chunk}")
+                    # Stream all agent reasoning and tool interactions
+                    content_lines = []
+                    # Handle the nested agent/tools structure
+                    if isinstance(chunk, dict):
+                        # Check for agent messages (reasoning and responses)
+                        if 'agent' in chunk and 'messages' in chunk['agent']:
+                            for message in chunk['agent']['messages']:
+                                if hasattr(message, 'content') and message.content:
+                                    content = str(message.content)
+                                    print(f"[DEBUG] Found agent message content: {content}")
+                                    # Check if this looks like structured agent reasoning
+                                    if content.startswith('Thought:') or content.startswith('Action:') or content.startswith('Action Input:'):
+                                        content_lines.append(content)
+                                    else:
+                                        # Regular agent response - add as thinking if it's reasoning
+                                        if len(content) > 20 and not content.startswith('Based on'):
+                                            content_lines.append(f"Thought: {content}")
+                                        else:
+                                            content_lines.append(content)
+
+                                # ✅ NEW: Check for tool calls in the agent message
+                                if hasattr(message, 'tool_calls') and message.tool_calls:
+                                    for tool_call in message.tool_calls:
+                                        tool_name = tool_call.get('name', 'unknown')
+                                        tool_args = tool_call.get('args', {})
+                                        content_lines.append(f"Action: {tool_name}")
+                                        if tool_args:
+                                            content_lines.append(f"Action Input: {json.dumps(tool_args)}")
+                                        print(f"[DEBUG] Found tool call in agent message: {tool_name}")
+
+                                # ✅ NEW: Check for tool calls in additional_kwargs (OpenAI format)
+                                if hasattr(message, 'additional_kwargs') and message.additional_kwargs:
+                                    tool_calls = message.additional_kwargs.get('tool_calls', [])
+                                    for tool_call in tool_calls:
+                                        if tool_call.get('type') == 'function':
+                                            func = tool_call.get('function', {})
+                                            tool_name = func.get('name', 'unknown')
+                                            tool_args = func.get('arguments', '{}')
+                                            content_lines.append(f"Action: {tool_name}")
+                                            if tool_args and tool_args != '{}':
+                                                content_lines.append(f"Action Input: {tool_args}")
+                                            print(f"[DEBUG] Found tool call in additional_kwargs: {tool_name}")
+                        # Check for tool messages (tool calls and outputs) - CAPTURE THESE
+                        elif 'tools' in chunk and 'messages' in chunk['tools']:
+                            for message in chunk['tools']['messages']:
+                                if hasattr(message, 'content') and message.content:
+                                    tool_content = str(message.content)
+                                    print(f"[DEBUG] Found tool message: {tool_content[:100]}...")
+                                    # Format as observation for frontend
+                                    content_lines.append(f"Observation: {tool_content}")
+                        # Handle tool calls directly from the chunk (fallback)
+                        elif 'action' in chunk or 'tool_calls' in chunk:
+                            if 'action' in chunk:
+                                action = chunk['action']
+                                if hasattr(action, 'tool'):
+                                    tool_name = getattr(action, 'tool', 'unknown')
+                                    tool_input = getattr(action, 'tool_input', {})
+                                    content_lines.append(f"Action: {tool_name}")
+                                    if tool_input:
+                                        content_lines.append(f"Action Input: {json.dumps(tool_input)}")
+                                    print(f"[DEBUG] Found action: {tool_name}")
+                            # Handle LangChain tool calls format
+                            if 'tool_calls' in chunk:
+                                for tool_call in chunk['tool_calls']:
+                                    if hasattr(tool_call, 'name'):
+                                        tool_name = tool_call.name
+                                        tool_args = getattr(tool_call, 'args', {})
+                                        content_lines.append(f"Action: {tool_name}")
+                                        if tool_args:
+                                            content_lines.append(f"Action Input: {json.dumps(tool_args)}")
+                                        print(f"[DEBUG] Found tool call: {tool_name}")
+                        # Handle agent thoughts/outcomes (fallback)
+                        elif 'agent_outcome' in chunk:
+                            outcome = chunk['agent_outcome']
+                            if hasattr(outcome, 'log') and outcome.log:
+                                content_lines.append(f"Thought: {outcome.log}")
+                                print(f"[DEBUG] Found agent thought: {outcome.log}")
+                        # Handle intermediate steps (fallback)
+                        elif 'intermediate_steps' in chunk:
+                            steps = chunk['intermediate_steps']
+                            for step in steps:
+                                if hasattr(step, 'action') and hasattr(step, 'observation'):
+                                    action = step.action
+                                    if hasattr(action, 'tool'):
+                                        tool_name = action.tool
+                                        tool_input = getattr(action, 'tool_input', {})
+                                        content_lines.append(f"Action: {tool_name}")
+                                        if tool_input:
+                                            content_lines.append(f"Action Input: {json.dumps(tool_input)}")
+                                    observation = step.observation
+                                    if observation:
+                                        content_lines.append(f"Observation: {observation}")
+                        # Fallback to direct content extraction
+                        elif 'content' in chunk:
+                            content_lines.append(str(chunk['content']))
+                            print(f"[DEBUG] Found direct content: {chunk['content']}")
+                    elif hasattr(chunk, 'content'):
+                        content_lines.append(str(chunk.content))
+                        print(f"[DEBUG] Found direct chunk content: {chunk.content}")
+                    # Also check if the chunk has tool-related attributes directly
+                    elif hasattr(chunk, 'tool_calls'):
+                        for tool_call in chunk.tool_calls:
+                            if hasattr(tool_call, 'function'):
+                                func = tool_call.function
+                                content_lines.append(f"Action: {func.name}")
+                                if hasattr(func, 'arguments'):
+                                    content_lines.append(f"Action Input: {func.arguments}")
+                    # DEBUG: Print what we're about to stream
+                    if content_lines:
+                        print(f"[DEBUG] About to stream {len(content_lines)} content lines:")
+                        for i, line in enumerate(content_lines):
+                            print(f"[DEBUG]   Line {i}: {line[:100]}...")
+                    else:
+                        print(f"[DEBUG] No content lines found in this chunk")
+                    # Stream each content line separately for real-time updates
+                    for content in content_lines:
+                        if content and content.strip():
+                            content_count += 1
+                            json_chunk = {
+                                "type": "content",
+                                "data": content.strip()
+                            }
+                            chunk_json = json.dumps(json_chunk) + "\n"
+                            print(f"[DEBUG] Yielding content {content_count}: {chunk_json.strip()}")
+                            yield chunk_json
+                    # Small delay between chunks to prevent overwhelming the frontend
+                    await asyncio.sleep(0.01)
+                print(f"[DEBUG] Stream finished. Processed {chunk_count} chunks, yielded {content_count} content chunks")
+                yield json.dumps({"type": "end"}) + "\n"
+            except Exception as e_inner:
+                print(f"[DEBUG] Exception: {e_inner}")
+                import traceback
+                traceback.print_exc()
+                error_chunk = {
+                    "type": "error",
+                    "data": f"Error: {str(e_inner)}"
+                }
+                yield json.dumps(error_chunk) + "\n"
+
+        return StreamingResponse(agent_stream(), media_type="application/json")
+    except Exception as e:
+        import traceback
+        def format_exception_recursive(exc, prefix=""):
+            import types
+            lines = []
+            lines.append(f"{prefix}[Error] {type(exc).__name__}: {exc}")
+            tb = traceback.format_exception(type(exc), exc, exc.__traceback__)
+            lines.extend([prefix + l.rstrip() for l in tb])
+            if hasattr(exc, 'exceptions') and isinstance(exc, BaseException):
+                for idx, sub in enumerate(getattr(exc, 'exceptions', [])):
+                    lines.append(f"{prefix}--- Sub-exception {idx+1} ---")
+                    lines.extend(format_exception_recursive(sub, prefix + "    "))
+            if getattr(exc, '__cause__', None):
+                lines.append(f"{prefix}Caused by:")
+                lines.extend(format_exception_recursive(exc.__cause__, prefix + "    "))
+            if getattr(exc, '__context__', None):
+                lines.append(f"{prefix}During handling of the above exception, another exception occurred:")
+                lines.extend(format_exception_recursive(exc.__context__, prefix + "    "))
+            return lines
+        async def error_stream(exc):
+            for line in format_exception_recursive(exc):
+                yield line + "\n"
+        return StreamingResponse(error_stream(e), media_type="text/plain")
+#--------------------------------------------------------------------------------------------------------------------------------------
+
+#--------------------------------------------------------------------------------------------------------------------------------------
 
 @app.post("/llm/agent")
 async def llm_agent(req: ChatRequest):
@@ -534,6 +789,9 @@ async def llm_agent_detailed(req: ChatRequest):
         }
 
 
+
+
+# --- New endpoint: Enhanced StructuredAgent with Claude-like response formatting ---
 @app.post("/llm/structured-agent")
 async def llm_structured_agent(req: ChatRequest):
     """
@@ -754,7 +1012,6 @@ async def groq_structured_agent(req: ChatRequest):
     #             if m["role"] == "user":
     #                 messages.append(HumanMessage(content=m["content"]))
     #             elif m["role"] == "assistant":
-    #                 from langchain_core.messages import AIMessage
     #                 messages.append(AIMessage(content=m["content"]))
     #     messages.append(HumanMessage(content=req.message))
     #     result = await agent.invoke(messages)
@@ -951,111 +1208,117 @@ def delete_mcp_server(name: str):
     save_mcp_servers(servers)
     return {"message": f"Server '{name}' deleted.", "servers": servers}
 
-# --- Debug endpoint for tool schemas ---
-@app.get("/debug/tool-schemas")
-async def debug_tool_schemas():
-    """Debug endpoint to inspect MCP tool schemas"""
+
+
+# --- New endpoint: Streaming StructuredAgent with formatted output ---
+@app.post("/llm/structured-agent-stream")
+async def llm_structured_agent_stream(req: ChatRequest):
+    """
+    Streaming endpoint for StructuredAgent responses. Streams reasoning, tool actions, and tool outputs 
+    in a clean, formatted manner similar to MCP reasoning responses.
+    """
     servers = get_mcp_servers()
-    
     if not servers:
-        return {"error": "No MCP servers configured"}
+        async def error_stream():
+            yield json.dumps({"type": "error", "data": "No MCP servers configured."}) + "\n"
+        return StreamingResponse(error_stream(), media_type="application/json")
     
     try:
-        # Get reachable servers
-        reachable_servers = {}
-        for server_name, server_config in servers.items():
+        reachable_servers = await get_reachable_servers(servers, skip_health_check=True)
+        if not reachable_servers:
+            async def error_stream():
+                yield json.dumps({"type": "error", "data": "No MCP servers configured."}) + "\n"
+            return StreamingResponse(error_stream(), media_type="application/json")
+        
+        client = MultiServerMCPClient(reachable_servers)
+        try:
+            tools = await client.get_tools()
+        except Exception as e:
+            reachable_servers = await get_reachable_servers(servers, skip_health_check=False)
+            if not reachable_servers:
+                async def error_stream():
+                    yield json.dumps({"type": "error", "data": "No MCP servers are currently reachable. Please check if your MCP servers are running."}) + "\n"
+                return StreamingResponse(error_stream(), media_type="application/json")
+            client = MultiServerMCPClient(reachable_servers)
+            tools = await client.get_tools()
+        
+        if not tools:
+            async def error_stream():
+                yield json.dumps({"type": "error", "data": "No tools available from reachable MCP servers."}) + "\n"
+            return StreamingResponse(error_stream(), media_type="application/json")
+        
+        agent = StructuredAgent(llm, tools)
+        
+        # --- Prepare messages from history ---
+        history = req.history
+        if req.chat_id:
+            history = get_and_update_chat_history(req.chat_id, req.history)
+        recent_history = history[-10:] if history and len(history) > 10 else history
+        messages = []
+        if recent_history:
+            for m in recent_history:
+                if m["role"] == "user":
+                    messages.append(HumanMessage(content=m["content"]))
+                elif m["role"] == "assistant":
+                    from langchain_core.messages import AIMessage
+                    messages.append(AIMessage(content=m["content"]))
+        messages.append(HumanMessage(content=req.message))
+
+        # --- Formatted streaming using agent.astream ---
+        async def structured_agent_stream():
             try:
-                async with Client(server_config["url"]) as client:
-                    await client.list_tools()
-                    reachable_servers[server_name] = server_config
+                step_count = 0
+                
+                async for step in agent.astream(messages):
+                    if step["type"] == "thought":
+                        step_count += 1
+                        # Raw output with tags for frontend formatting
+                        yield json.dumps({"type": "content", "data": f"<thought>{step['content']}</thought>"}) + "\n"
+                    
+                    elif step["type"] == "tool_execution":
+                        # Wrap all tool-related parts under one tag for frontend rendering
+                        tool_name = step.get('tool_name', 'Unknown Tool')
+                        
+                        # Start tool use wrapper
+                        yield json.dumps({"type": "content", "data": f"<tool_use>"}) + "\n"
+                        yield json.dumps({"type": "content", "data": f"<action>{tool_name}</action>"}) + "\n"
+                        
+                        # Tool arguments if present
+                        if step.get("arguments"):
+                            args_formatted = json.dumps(step['arguments'], indent=2)
+                            yield json.dumps({"type": "content", "data": f"<action_input>{args_formatted}</action_input>"}) + "\n"
+                        
+                        # Tool result if present
+                        if step.get("result"):
+                            result_str = str(step['result'])
+                            # Special handling for create_visualization tool
+                            yield json.dumps({"type": "content", "data": f"<observation>{result_str}</observation>"}) + "\n"
+                        
+                        # End tool use wrapper
+                        yield json.dumps({"type": "content", "data": f"</tool_use>"}) + "\n"
+                    
+                    elif step["type"] == "final_answer":
+                        if step.get("content"):
+                            # Raw output with tags for frontend formatting
+                            yield json.dumps({"type": "content", "data": f"<final_answer>{step['content']}</final_answer>"}) + "\n"
+                    
+                    # Small delay between chunks for proper streaming
+                    await asyncio.sleep(0.01)
+                
+                yield json.dumps({"type": "end"}) + "\n"
+                
             except Exception as e:
-                print(f"Warning: MCP server '{server_name}' unreachable: {e}")
-                continue
-        
-        if not reachable_servers:
-            return {"error": "No reachable MCP servers"}
-        
-        client = MultiServerMCPClient(reachable_servers)
-        tools = await client.get_tools()
-        
-        # Create debug agent to inspect schemas
-        from agent.custom_agent import StructuredAgent
-        agent = StructuredAgent(llm, tools)
-        debug_info = agent.debug_tool_schemas()
-        
-        return {
-            "reachable_servers": list(reachable_servers.keys()),
-            "tool_count": len(tools),
-            "tool_schemas": debug_info
-        }
+                error_content = f"<error>Structured agent encountered an error: {str(e)}</error>"
+                yield json.dumps({"type": "error", "data": error_content}) + "\n"
+
+        return StreamingResponse(structured_agent_stream(), media_type="application/json")
         
     except Exception as e:
-        return {"error": f"Debug error: {str(e)}"}
-
-@app.get("/debug/tool-example/{tool_name}")
-async def get_tool_example(tool_name: str):
-    """Get usage example for a specific tool"""
-    servers = get_mcp_servers()
+        async def error_stream():
+            error_content = f"<error>Structured agent error: {str(e)}</error>"
+            yield json.dumps({"type": "error", "data": error_content}) + "\n"
+        return StreamingResponse(error_stream(), media_type="application/json")
     
-    try:
-        reachable_servers = {}
-        for server_name, server_config in servers.items():
-            try:
-                async with Client(server_config["url"]) as client:
-                    await client.list_tools()
-                    reachable_servers[server_name] = server_config
-            except Exception:
-                continue
-        
-        if not reachable_servers:
-            return {"error": "No reachable MCP servers"}
-        
-        client = MultiServerMCPClient(reachable_servers)
-        tools = await client.get_tools()
-        
-        from agent.custom_agent import StructuredAgent
-        agent = StructuredAgent(llm, tools)
-        example = agent.get_tool_usage_example(tool_name)
-        
-        return {"example": example}
-        
-    except Exception as e:
-        return {"error": f"Error: {str(e)}"}
-
-# --- New endpoint for checking server health on demand ---
-
-@app.get("/mcp/server-health")
-async def check_mcp_server_health():
-    """Check the health status of all MCP servers. Use this when you need to know which servers are actually reachable."""
-    servers = get_mcp_servers()
-
-    if not servers:
-        return {"error": "No MCP servers configured", "servers": {}}
-
-    health_status = {}
-    for server_name, server_config in servers.items():
-        is_healthy = await check_server_health(server_name, server_config)
-        # Use url if present, else command/args for display
-        if "url" in server_config:
-            location = server_config["url"]
-        elif "command" in server_config:
-            location = f"{server_config['command']} {' '.join(server_config.get('args', []))}"
-        else:
-            location = "unknown"
-        health_status[server_name] = {
-            "location": location,
-            "healthy": is_healthy,
-            "status": "reachable" if is_healthy else "unreachable"
-        }
-
-    reachable_count = sum(1 for status in health_status.values() if status["healthy"])
-
-    return {
-        "servers": health_status,
-        "total_servers": len(servers),
-        "reachable_servers": reachable_count,
-        "all_healthy": reachable_count == len(servers)
-    }
 
 @app.post("/mcp/clear-health-cache")
 async def clear_health_cache():

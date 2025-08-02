@@ -1,16 +1,13 @@
 servers:
-  ds:
-    transport: streamable_http
-    url: http://localhost:8003/mcp
-  dexdb:
-    transport: streamable_http
-    url: http://localhost:8004/mcp
-  simple-arxiv:
-    command: "C:\\Users\\jimmy\\AppData\\Local\\Programs\\Python\\Python310\\python.exe"
-    args:
-      - -m
-      - mcp_simple_arxiv
-    transport: stdio
   azdbexp:
-    url: http://localhost:8005/mcp
     transport: streamable_http
+    url: http://localhost:8005/mcp
+  # ds:
+  #   transport: streamable_http
+  #   url: http://localhost:8003/mcp
+  # simple-arxiv:
+  #   args:
+  #   - -m
+  #   - mcp_simple_arxiv
+  #   command: C:\Users\jimmy\AppData\Local\Programs\Python\Python310\python.exe
+  #   transport: stdio
