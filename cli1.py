@@ -1268,206 +1268,170 @@ async def llm_structured_agent_stream(req: ChatRequest):
                     messages.append(AIMessage(content=m["content"]))
         messages.append(HumanMessage(content=req.message))
 
-        # --- Formatted streaming using agent.astream ---
+        # --- Structured JSON streaming protocol ---
         async def structured_agent_stream():
             try:
                 step_count = 0
                 last_thought_content = ""  # Track last thinking content for deduplication
                 
-                def extract_tool_calls_from_content(content):
-                    """Extract tool calls from content and return clean content + tool calls"""
+                def clean_content_for_similarity(content):
+                    """Clean content for similarity comparison"""
                     import re
-                    
-                    # Pattern to match various tool use block formats in content
-                    # Handles both <inputs> and <parameters> variations
-                    tool_pattern = r'<tool_use><action>([^<]+)</action><(?:inputs|parameters)>([^<]+)</(?:inputs|parameters)></tool_use>'
-                    
-                    tool_calls = []
-                    matches = re.findall(tool_pattern, content, re.DOTALL)
-                    
-                    for match in matches:
-                        tool_name = match[0].strip()
-                        try:
-                            # Parse the arguments JSON
-                            args_text = match[1].strip()
-                            tool_args = json.loads(args_text)
-                            
-                            # Handle nested args structure (like {"args": {...}})
-                            if isinstance(tool_args, dict) and "args" in tool_args:
-                                tool_args = tool_args["args"]
-                            
-                            tool_calls.append({
-                                "tool_name": tool_name,
-                                "arguments": tool_args
-                            })
-                        except json.JSONDecodeError:
-                            # If JSON parsing fails, skip this tool call
-                            continue
-                    
-                    # Clean the content by removing tool use blocks
-                    clean_content = re.sub(tool_pattern, '', content, flags=re.DOTALL)
-                    
-                    # Also handle standalone tool calls without <tool_use> wrapper
-                    action_pattern = r'<action>([^<]+)</action>\s*<(?:inputs|parameters)>([^<]+)</(?:inputs|parameters)>'
-                    action_matches = re.findall(action_pattern, clean_content, re.DOTALL)
-                    
-                    for match in action_matches:
-                        tool_name = match[0].strip()
-                        try:
-                            args_text = match[1].strip()
-                            tool_args = json.loads(args_text)
-                            
-                            if isinstance(tool_args, dict) and "args" in tool_args:
-                                tool_args = tool_args["args"]
-                            
-                            tool_calls.append({
-                                "tool_name": tool_name,
-                                "arguments": tool_args
-                            })
-                        except json.JSONDecodeError:
-                            continue
-                    
-                    # Clean action patterns too
-                    clean_content = re.sub(action_pattern, '', clean_content, flags=re.DOTALL)
-                    
-                    # Clean up extra whitespace and newlines
-                    clean_content = re.sub(r'\n\s*\n', '\n\n', clean_content.strip())
-                    
-                    return clean_content, tool_calls
+                    # Remove markdown headers, extra spaces, and normalize
+                    cleaned = re.sub(r'#+\s*', '', content)  # Remove markdown headers
+                    cleaned = re.sub(r'\s+', ' ', cleaned)   # Normalize whitespace
+                    return cleaned.lower().strip()
                 
-                def split_tag_blocks(content):
-                    tag_pattern = re.compile(r'<(thought|tool_use|action|action_input|observation|final_answer|error)>(.*?)</\1>', re.DOTALL)
-                    pos = 0
-                    blocks = []
-                    for match in tag_pattern.finditer(content):
-                        if match.start() > pos:
-                            text = content[pos:match.start()].strip()
-                            if text:
-                                blocks.append((None, text))
-                        blocks.append((match.group(1), match.group(2).strip()))
-                        pos = match.end()
-                    if pos < len(content):
-                        text = content[pos:].strip()
-                        if text:
-                            blocks.append((None, text))
-                    return blocks
+                def is_content_similar(content1, content2, threshold=0.7):
+                    """Check if two content pieces are similar using multiple methods"""
+                    if not content1 or not content2:
+                        return False
+                    
+                    # Normalize content for comparison
+                    norm1 = clean_content_for_similarity(content1)
+                    norm2 = clean_content_for_similarity(content2)
+                    
+                    # Method 1: Jaccard similarity
+                    words1 = set(norm1.split())
+                    words2 = set(norm2.split())
+                    
+                    if words1 and words2:
+                        common_words = words1.intersection(words2)
+                        all_words = words1.union(words2)
+                        jaccard_similarity = len(common_words) / len(all_words)
+                        
+                        # Method 2: Substring check
+                        substring_similarity = 1.0 if (norm1 in norm2 or norm2 in norm1) else 0
+                        
+                        # Method 3: Length ratio
+                        length_ratio = min(len(norm1), len(norm2)) / max(len(norm1), len(norm2))
+                        
+                        # Return True if content is similar by any method
+                        return (jaccard_similarity > threshold or 
+                                substring_similarity > 0.8 or 
+                                (jaccard_similarity > 0.5 and length_ratio > 0.8))
+                    
+                    return False
 
                 async for step in agent.astream(messages):
                     if step["type"] == "thought":
                         step_count += 1
-                        thought_content = step['content']
-                        # Split into tag blocks and yield each as a separate JSON object
-                        blocks = split_tag_blocks(thought_content)
-                        for tag, inner in blocks:
-                            if tag is None:
-                                # Plain text, wrap in <thought>
-                                if inner.strip():
-                                    last_thought_content = inner.strip()
-                                    yield json.dumps({"type": "content", "data": f"<thought>{inner.strip()}</thought>"}) + "\n"
-                            else:
-                                # Always yield each tag block as its own JSON object
-                                if inner.strip():
-                                    if tag == "thought":
-                                        last_thought_content = inner.strip()
-                                    yield json.dumps({"type": "content", "data": f"<{tag}>{inner.strip()}</{tag}>"}) + "\n"
+                        thought_content = step['content'].strip()
+                        
+                        if thought_content:
+                            last_thought_content = thought_content
+                            # Emit structured thought block - frontend will render as markdown
+                            yield json.dumps({
+                                "type": "thought",
+                                "content": thought_content,
+                                "step": step_count
+                            }) + "\n"
                     
                     elif step["type"] == "tool_execution":
                         tool_name = step.get('tool_name', 'Unknown Tool')
                         
+                        def format_tool_result(result):
+                            """Format tool result for better display"""
+                            if result is None:
+                                return None
+                            
+                            result_str = str(result)
+                            # Truncate very long results but preserve structure
+                            # if len(result_str) > 2000:
+                            #     return result_str[:2000] + "... (truncated)"
+                            return result_str
+                        
+                        def format_arguments(args):
+                            """Format arguments for better display"""
+                            if not args:
+                                return {}
+                            
+                            # If args is a string, try to parse as JSON for better formatting
+                            if isinstance(args, str):
+                                try:
+                                    import json as json_lib
+                                    return json_lib.loads(args)
+                                except:
+                                    return {"raw": args}
+                            return args
+                        
                         # Check if this is a multi-tool call
                         if tool_name == "multi_tool_use.parallel" and step.get("arguments"):
-                            # Handle parallel multi-tool calls - emit separate blocks for each sub-tool
+                            # Handle parallel multi-tool calls
                             args = step.get("arguments", {})
                             tool_uses = args.get("tool_uses", [])
                             
-                            for sub_tool in tool_uses:
-                                yield json.dumps({"type": "content", "data": f"<tool_use>"}) + "\n"
-                                
-                                # Extract sub-tool name and parameters
+                            for i, sub_tool in enumerate(tool_uses):
                                 recipient_name = sub_tool.get("recipient_name", "unknown")
-                                # Clean up the recipient name (remove "functions." prefix if present)
                                 clean_name = recipient_name.replace("functions.", "") if recipient_name.startswith("functions.") else recipient_name
-                                yield json.dumps({"type": "content", "data": f"<action>{clean_name}</action>"}) + "\n"
-                                
-                                # Sub-tool parameters
                                 sub_params = sub_tool.get("parameters", {})
-                                if sub_params:
-                                    sub_args_formatted = json.dumps(sub_params, indent=2)
-                                    yield json.dumps({"type": "content", "data": f"<action_input>{sub_args_formatted}</action_input>"}) + "\n"
                                 
-                                yield json.dumps({"type": "content", "data": f"</tool_use>"}) + "\n"
+                                # Emit structured tool use block with enhanced formatting
+                                yield json.dumps({
+                                    "type": "tool_use",
+                                    "tool_name": clean_name,
+                                    "arguments": format_arguments(sub_params),
+                                    "result": None,  # Will be filled when result comes
+                                    "parallel_index": i,
+                                    "is_parallel": True,
+                                    "status": "executing",
+                                    "timestamp": time.time()
+                                }) + "\n"
                         else:
                             # Handle single tool calls
-                            yield json.dumps({"type": "content", "data": f"<tool_use>"}) + "\n"
-                            yield json.dumps({"type": "content", "data": f"<action>{tool_name}</action>"}) + "\n"
+                            tool_result = step.get("result")
+                            execution_time = step.get("execution_time")
                             
-                            # Tool arguments if present
-                            if step.get("arguments"):
-                                args_formatted = json.dumps(step['arguments'], indent=2)
-                                yield json.dumps({"type": "content", "data": f"<action_input>{args_formatted}</action_input>"}) + "\n"
-                            
-                            # Tool result if present
-                            if step.get("result"):
-                                result_str = str(step['result'])
-                                yield json.dumps({"type": "content", "data": f"<observation>{result_str}</observation>"}) + "\n"
-                            
-                            yield json.dumps({"type": "content", "data": f"</tool_use>"}) + "\n"
+                            # Emit structured tool use block with enhanced formatting
+                            yield json.dumps({
+                                "type": "tool_use",
+                                "tool_name": tool_name,
+                                "arguments": format_arguments(step.get("arguments", {})),
+                                "result": format_tool_result(tool_result),
+                                "is_parallel": False,
+                                "status": "completed" if tool_result is not None else "executing",
+                                "execution_time": execution_time,
+                                "timestamp": time.time(),
+                                "result_type": "success" if tool_result is not None and "error" not in str(tool_result).lower() else "error"
+                            }) + "\n"
                     
                     elif step["type"] == "final_answer":
                         if step.get("content"):
                             final_content = step['content'].strip()
-                            # Check for substantial similarity with last thinking content
-                            # Skip if final answer is very similar to the last thought
-                            similarity_threshold = 0.7  # 70% similarity threshold (lowered)
-                            should_output_final = True
                             
-                            if last_thought_content and final_content:
-                                # Normalize content for comparison (remove markdown, extra spaces, etc.)
-                                final_normalized = ' '.join(final_content.lower().replace('#', '').split())
-                                thought_normalized = ' '.join(last_thought_content.lower().replace('#', '').split())
-                                
-                                # Calculate similarity using multiple methods
-                                final_words = set(final_normalized.split())
-                                thought_words = set(thought_normalized.split())
-                                
-                                if final_words and thought_words:
-                                    # Method 1: Jaccard similarity (intersection over union)
-                                    common_words = final_words.intersection(thought_words)
-                                    all_words = final_words.union(thought_words)
-                                    jaccard_similarity = len(common_words) / len(all_words) if all_words else 0
-                                    
-                                    # Method 2: Length-based similarity check
-                                    length_ratio = min(len(final_normalized), len(thought_normalized)) / max(len(final_normalized), len(thought_normalized))
-                                    
-                                    # Method 3: Direct substring check (for very similar content)
-                                    substring_similarity = 0
-                                    if final_normalized in thought_normalized or thought_normalized in final_normalized:
-                                        substring_similarity = 1.0
-                                    
-                                    # If any similarity method indicates high similarity, skip final answer
-                                    if (jaccard_similarity > similarity_threshold or 
-                                        substring_similarity > 0.8 or 
-                                        (jaccard_similarity > 0.5 and length_ratio > 0.8)):
-                                        should_output_final = False
+                            # Check for similarity with last thought
+                            should_output_final = not is_content_similar(last_thought_content, final_content)
                             
                             if should_output_final:
-                                yield json.dumps({"type": "content", "data": f"<final_answer>{final_content}</final_answer>"}) + "\n"
+                                # Emit structured final answer - frontend will render as markdown
+                                yield json.dumps({
+                                    "type": "final_answer",
+                                    "content": final_content
+                                }) + "\n"
                     
                     # Small delay between chunks for proper streaming
                     await asyncio.sleep(0.01)
                 
-                yield json.dumps({"type": "end"}) + "\n"
+                # Emit completion signal
+                yield json.dumps({"type": "stream_end"}) + "\n"
                 
             except Exception as e:
-                error_content = f"<error>Structured agent encountered an error: {str(e)}</error>"
-                yield json.dumps({"type": "error", "data": error_content}) + "\n"
+                # Emit structured error
+                yield json.dumps({
+                    "type": "error",
+                    "error_type": type(e).__name__,
+                    "message": str(e)
+                }) + "\n"
 
         return StreamingResponse(structured_agent_stream(), media_type="application/json")
         
     except Exception as e:
         async def error_stream():
-            error_content = f"<error>Structured agent error: {str(e)}</error>"
-            yield json.dumps({"type": "error", "data": error_content}) + "\n"
+            yield json.dumps({
+                "type": "error",
+                "error_type": type(e).__name__,
+                "message": str(e)
+            }) + "\n"
         return StreamingResponse(error_stream(), media_type="application/json")
     
 
