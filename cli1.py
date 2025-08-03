@@ -1283,7 +1283,7 @@ async def llm_structured_agent_stream(req: ChatRequest):
                         tool_name = step.get('tool_name', 'Unknown Tool')
                         
                         # Start tool use wrapper
-                        yield json.dumps({"type": "content", "data": f"<tool_use> {tool_name}"}) + "\n"
+                        yield json.dumps({"type": "content", "data": f"<tool_use>"}) + "\n"
                         yield json.dumps({"type": "content", "data": f"<action>{tool_name}</action>"}) + "\n"
                         
                         # Tool arguments if present
