@@ -634,6 +634,7 @@ class StructuredAgent:
 
     async def _execute_tools(self, tool_calls: List[Dict]) -> List[ToolMessage]:
         """Execute multiple tool calls asynchronously"""
+        import traceback
         tool_messages = []
         
         for tool_call in tool_calls:
@@ -652,7 +653,16 @@ class StructuredAgent:
                     else:
                         result = await asyncio.to_thread(tool.run, tool_args)
                 except Exception as e:
-                    result = f"Error executing {tool_name}: {str(e)}"
+                    # Enhanced error logging for debugging
+                    error_msg = str(e) if str(e) else "Unknown error (empty exception message)"
+                    print(f"Tool execution error for {tool_name}:")
+                    print(f"  Arguments: {tool_args}")
+                    print(f"  Result: {error_msg}")
+                    print(f"  Error details: {e}")
+                    print(f"  Full step: {{'type': 'tool_execution', 'iteration': 1, 'tool_name': '{tool_name}', 'arguments': {tool_args}, 'result': 'Error executing {tool_name}: {error_msg}'}}")
+                    print(f"  Exception type: {type(e).__name__}")
+                    print(f"  Traceback: {traceback.format_exc()}")
+                    result = f"Error executing {tool_name}: {error_msg}"
             
             tool_messages.append(
                 ToolMessage(

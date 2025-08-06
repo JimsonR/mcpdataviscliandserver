@@ -13,6 +13,7 @@ import time
 import traceback
 import tiktoken
 import re
+from langchain_mcp_adapters.tools import load_mcp_tools
 
 import json
 from fastapi.responses import StreamingResponse
@@ -241,7 +242,14 @@ async def list_mcp_tools(server: str):
     server_cfg = get_server_cfg(server)
     async with get_server_client(server_cfg) as client:
         tools = await client.list_tools()
-        return [t.model_dump() if hasattr(t, 'model_dump') else t for t in tools]
+        # Adapt tool schemas: if 'inputSchema' exists, copy to 'parameters' for agent compatibility
+        adapted_tools = []
+        for t in tools:
+            tool_dict = t.model_dump() if hasattr(t, 'model_dump') else dict(t)
+            if 'inputSchema' in tool_dict and 'parameters' not in tool_dict:
+                tool_dict['parameters'] = tool_dict['inputSchema']
+            adapted_tools.append(tool_dict)
+        return adapted_tools
 
 
 
@@ -1235,8 +1243,15 @@ async def llm_structured_agent_stream(req: ChatRequest):
             return StreamingResponse(error_stream(), media_type="application/json")
         
         client = MultiServerMCPClient(reachable_servers)
+        
+        # Use the working approach but add session context for browser tools
         try:
             tools = await client.get_tools()
+            print(f"Loaded {len(tools)} tools from all servers")
+            if tools:
+                tool_names = [tool.name for tool in tools if hasattr(tool, 'name')]
+                print(f"Available tools: {tool_names[:10]}...")  # Show first 10 tools
+                    
         except Exception as e:
             reachable_servers = await get_reachable_servers(servers, skip_health_check=False)
             if not reachable_servers:
@@ -1245,12 +1260,10 @@ async def llm_structured_agent_stream(req: ChatRequest):
                 return StreamingResponse(error_stream(), media_type="application/json")
             client = MultiServerMCPClient(reachable_servers)
             tools = await client.get_tools()
-        
         if not tools:
             async def error_stream():
                 yield json.dumps({"type": "error", "data": "No tools available from reachable MCP servers."}) + "\n"
             return StreamingResponse(error_stream(), media_type="application/json")
-        
         agent = StructuredAgent(llm, tools)
         
         # --- Prepare messages from history ---
@@ -1381,6 +1394,15 @@ async def llm_structured_agent_stream(req: ChatRequest):
                             # Handle single tool calls
                             tool_result = step.get("result")
                             execution_time = step.get("execution_time")
+                            error_details = step.get("error")
+                            
+                            # Enhanced error logging for debugging
+                            if error_details or (tool_result and "error" in str(tool_result).lower()):
+                                print(f"Tool execution error for {tool_name}:")
+                                print(f"  Arguments: {step.get('arguments', {})}")
+                                print(f"  Result: {tool_result}")
+                                print(f"  Error details: {error_details}")
+                                print(f"  Full step: {step}")
                             
                             # Emit structured tool use block with enhanced formatting
                             yield json.dumps({
@@ -1388,6 +1410,7 @@ async def llm_structured_agent_stream(req: ChatRequest):
                                 "tool_name": tool_name,
                                 "arguments": format_arguments(step.get("arguments", {})),
                                 "result": format_tool_result(tool_result),
+                                "error_details": error_details,
                                 "is_parallel": False,
                                 "status": "completed" if tool_result is not None else "executing",
                                 "execution_time": execution_time,
@@ -1422,6 +1445,9 @@ async def llm_structured_agent_stream(req: ChatRequest):
                     "error_type": type(e).__name__,
                     "message": str(e)
                 }) + "\n"
+            finally:
+                # Session cleanup removed - using simpler approach
+                pass
 
         return StreamingResponse(structured_agent_stream(), media_type="application/json")
         
@@ -1433,7 +1459,7 @@ async def llm_structured_agent_stream(req: ChatRequest):
                 "message": str(e)
             }) + "\n"
         return StreamingResponse(error_stream(), media_type="application/json")
-    
+
 
 @app.post("/mcp/clear-health-cache")
 async def clear_health_cache():

@@ -2,14 +2,14 @@ servers:
   azdbexp:
     transport: streamable_http
     url: http://localhost:8005/mcp
-  playwright:
-      "args":
-      - "@playwright/mcp@latest"
-      - --browser
-      - firefox
-      command: npx
-      "transport": "stdio"
-    
+  # playwright:
+  #   args:
+  #   - "@playwright/mcp@latest"
+  #   - --browser
+  #   - chrome
+  #   command: npx
+  #   transport: stdio
+
   # ds:
   #   transport: streamable_http
   #   url: http://localhost:8003/mcp
