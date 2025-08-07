@@ -226,6 +226,22 @@ class DataExplorationArgs(BaseModel):
     specific_columns: Optional[List[str]] = None
 
 @mcp.tool()
+def restart_azure_sql_connection(args: Any = None) -> list:
+    """
+    Restart the Azure SQL connection if it has expired or is not initialized.
+    """
+    global conn
+    try:
+        init_azure_sql_connection()
+        if conn is not None:
+            return [TextContent(type="text", text="Azure SQL connection restarted successfully.")]
+        else:
+            return [TextContent(type="text", text="Failed to restart Azure SQL connection.")]
+    except Exception as e:
+        return [TextContent(type="text", text=f"Error restarting Azure SQL connection: {str(e)}")]
+    
+
+@mcp.tool()
 def explore_data_patterns(args: DataExplorationArgs) -> list:
     """Systematic data exploration inspired by RAISE's database exploration strategy"""
     global _dataframes, _data_insights

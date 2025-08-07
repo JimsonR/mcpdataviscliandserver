@@ -4,7 +4,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastmcp import Client
 from langchain_openai import AzureChatOpenAI
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+from langchain_core.tools import Tool
 from dotenv import load_dotenv
 from pydantic import BaseModel
 import os
@@ -31,6 +32,7 @@ from sessions.redis_backend import (
 
 from agent.custom_agent import StructuredAgent
 import types
+from fastmcp.client.transports import StdioTransport
 
 
 load_dotenv(".env")
@@ -1530,6 +1532,332 @@ LLM_MAX_TOKENS = {
     "gpt-4o": 128000,
     # Add more as needed
 }
+
+# --- Playwright-compatible streaming endpoint ---
+@app.post("/llm/playwright-structured-agent-stream")
+async def playwright_structured_agent_stream(req: ChatRequest):
+    """
+    Streaming endpoint optimized for Playwright and stdio-based MCP servers.
+    Uses individual client connections instead of MultiServerMCPClient for better compatibility.
+    """
+    servers = get_mcp_servers()
+    if not servers:
+        async def error_stream():
+            yield json.dumps({"type": "error", "data": "No MCP servers configured."}) + "\n"
+        return StreamingResponse(error_stream(), media_type="application/json")
+    
+    try:
+        # Filter for reachable servers but handle stdio servers specially
+        reachable_servers = await get_reachable_servers(servers, skip_health_check=True)
+        if not reachable_servers:
+            async def error_stream():
+                yield json.dumps({"type": "error", "data": "No MCP servers configured."}) + "\n"
+            return StreamingResponse(error_stream(), media_type="application/json")
+        
+        print(f"Using {len(reachable_servers)} servers: {list(reachable_servers.keys())}")
+        
+        # Create individual clients for each server (better for stdio servers like Playwright)
+        all_tools = []
+        active_clients = {}
+        
+        for server_name, server_config in reachable_servers.items():
+            try:
+                if server_config.get("transport") == "stdio":
+                    # Handle stdio servers directly
+                    from fastmcp.client.transports import StdioTransport
+                    from fastmcp.client import Client
+                    
+                    transport = StdioTransport(
+                        server_config["command"], 
+                        server_config.get("args", [])
+                    )
+                    client = Client(transport)
+                    await client.__aenter__()
+                    active_clients[server_name] = client
+                    
+                    # Get tools from this client
+                    try:
+                        tools = await client.list_tools()
+                        tools = [t.model_dump() if hasattr(t, 'model_dump') else t for t in tools]
+                        
+                        # Ensure proper tool schema format
+                        for tool in tools:
+                            if 'parameters' not in tool:
+                                if 'inputSchema' in tool:
+                                    tool['parameters'] = tool['inputSchema']
+                                else:
+                                    tool['parameters'] = {"type": "object", "properties": {}}
+                        
+                        print(f"[DEBUG] Tools loaded from {server_name}: {[t['name'] for t in tools]}")
+                        all_tools.extend(tools)
+                        
+                    except Exception as e:
+                        print(f"Error getting tools from {server_name}: {e}")
+                        continue
+                        
+                else:
+                    # Handle URL-based servers with MultiServerMCPClient
+                    single_server = {server_name: server_config}
+                    client = MultiServerMCPClient(single_server)
+                    active_clients[server_name] = client
+                    
+                    try:
+                        tools = await client.get_tools()
+                        all_tools.extend(tools)
+                        print(f"[DEBUG] Tools loaded from {server_name}: {[t.name for t in tools if hasattr(t, 'name')]}")
+                    except Exception as e:
+                        print(f"Error getting tools from {server_name}: {e}")
+                        continue
+                        
+            except Exception as e:
+                print(f"Error connecting to server {server_name}: {e}")
+                continue
+        
+        if not all_tools:
+            async def error_stream():
+                yield json.dumps({"type": "error", "data": "No tools available from reachable MCP servers."}) + "\n"
+            return StreamingResponse(error_stream(), media_type="application/json")
+        
+        # Create tool executor function that routes to appropriate client
+        async def tool_executor(tool_name, tool_args):
+            print(f"[DEBUG] Executing tool: {tool_name} with args: {tool_args}")
+            
+            # Find which client has this tool
+            for server_name, client in active_clients.items():
+                try:
+                    if hasattr(client, 'call_tool'):
+                        # FastMCP client (stdio)
+                        result = await client.call_tool(tool_name, tool_args)
+                        print(f"[DEBUG] Tool '{tool_name}' result from {server_name}: {result}")
+                        return result
+                    else:
+                        # MultiServerMCPClient
+                        # Try to execute tool - it will error if tool not available
+                        tools = await client.get_tools()
+                        tool_names = [t.name for t in tools if hasattr(t, 'name')]
+                        if tool_name in tool_names:
+                            # Execute via LangChain tool
+                            for tool in tools:
+                                if hasattr(tool, 'name') and tool.name == tool_name:
+                                    if hasattr(tool, 'arun'):
+                                        result = await tool.arun(tool_args)
+                                    elif hasattr(tool, 'run'):
+                                        result = await asyncio.to_thread(tool.run, tool_args)
+                                    else:
+                                        result = await tool.ainvoke(tool_args)
+                                    print(f"[DEBUG] Tool '{tool_name}' result from {server_name}: {result}")
+                                    return result
+                except Exception as e:
+                    print(f"[DEBUG] Tool '{tool_name}' not available in {server_name}: {e}")
+                    continue
+            
+            return {"error": f"Tool '{tool_name}' not found in any active server"}
+        
+        # Create StructuredAgent with the combined tools
+        # Convert tool schemas to proper LangChain tools for StructuredAgent
+        import json as json_lib
+        
+        print(f"[DEBUG] Converting {len(all_tools)} tool schemas to LangChain tools")
+        langchain_tools = []
+        for tool_schema in all_tools:
+            tool_name = tool_schema.get('name')
+            tool_description = tool_schema.get('description', '')
+            
+            print(f"[DEBUG] Converting tool: {tool_name}")
+            
+            # Create a closure to capture tool_name for each tool
+            def make_tool_func(captured_tool_name):
+                async def tool_func(**kwargs):
+                    print(f"[DEBUG] Tool {captured_tool_name} called with args: {kwargs}")
+                    return await tool_executor(captured_tool_name, kwargs)
+                return tool_func
+            
+            langchain_tools.append(Tool(
+                name=tool_name,
+                description=tool_description,
+                func=None,
+                coroutine=make_tool_func(tool_name)
+            ))
+        
+        print(f"[DEBUG] Created {len(langchain_tools)} LangChain tools")
+        agent = StructuredAgent(llm, langchain_tools)
+        
+        # --- Prepare messages from history ---
+        history = req.history
+        if req.chat_id:
+            history = get_and_update_chat_history(req.chat_id, req.history)
+        recent_history = history[-10:] if history and len(history) > 10 else history
+        messages = []
+        if recent_history:
+            for m in recent_history:
+                if m["role"] == "user":
+                    messages.append(HumanMessage(content=m["content"]))
+                elif m["role"] == "assistant":
+                    messages.append(AIMessage(content=m["content"]))
+        messages.append(HumanMessage(content=req.message))
+
+        # --- Enhanced agent execution with direct tool control ---
+        async def playwright_agent_stream():
+            try:
+                step_count = 0
+                last_thought_content = ""
+                
+                def clean_content_for_similarity(content):
+                    """Clean content for similarity comparison"""
+                    cleaned = re.sub(r'#+\s*', '', content)
+                    cleaned = re.sub(r'\s+', ' ', cleaned)
+                    return cleaned.lower().strip()
+                
+                def is_content_similar(content1, content2, threshold=0.7):
+                    """Check if two content pieces are similar"""
+                    if not content1 or not content2:
+                        return False
+                    
+                    norm1 = clean_content_for_similarity(content1)
+                    norm2 = clean_content_for_similarity(content2)
+                    
+                    words1 = set(norm1.split())
+                    words2 = set(norm2.split())
+                    
+                    if words1 and words2:
+                        common_words = words1.intersection(words2)
+                        all_words = words1.union(words2)
+                        jaccard_similarity = len(common_words) / len(all_words)
+                        return jaccard_similarity > threshold
+                    
+                    return False
+
+                # Create agent with tool execution override
+                class PlaywrightAgent(StructuredAgent):
+                    def __init__(self, llm, tools, tool_executor_func):
+                        super().__init__(llm, tools)
+                        self.custom_tool_executor = tool_executor_func
+                    
+                    async def _execute_tools(self, tool_calls):
+                        """Override tool execution to use our custom executor"""
+                        tool_messages = []
+                        
+                        for tool_call in tool_calls:
+                            tool_name = tool_call['name']
+                            tool_args = tool_call['args']
+                            
+                            try:
+                                result = await self.custom_tool_executor(tool_name, tool_args)
+                            except Exception as e:
+                                result = f"Error executing {tool_name}: {str(e)}"
+                            
+                            tool_messages.append(
+                                ToolMessage(
+                                    content=str(result),
+                                    tool_call_id=tool_call['id'],
+                                    name=tool_name
+                                )
+                            )
+                        
+                        return tool_messages
+                
+                playwright_agent = PlaywrightAgent(llm, langchain_tools, tool_executor)
+                
+                print(f"[DEBUG] Starting agent stream with {len(langchain_tools)} tools")
+                print(f"[DEBUG] Tool names: {[t.name for t in langchain_tools]}")
+
+                async for step in playwright_agent.astream(messages):
+                    if step["type"] == "thought":
+                        step_count += 1
+                        thought_content = step['content'].strip()
+                        
+                        if thought_content:
+                            last_thought_content = thought_content
+                            yield json.dumps({
+                                "type": "thought",
+                                "content": thought_content,
+                                "step": step_count
+                            }) + "\n"
+                    
+                    elif step["type"] == "tool_execution":
+                        tool_name = step.get('tool_name', 'Unknown Tool')
+                        tool_result = step.get("result")
+                        
+                        def format_tool_result(result):
+                            if result is None:
+                                return None
+                            result_str = str(result)
+                            return result_str
+                        
+                        def format_arguments(args):
+                            if not args:
+                                return {}
+                            if isinstance(args, str):
+                                try:
+                                    return json_lib.loads(args)
+                                except:
+                                    return {"raw": args}
+                            return args
+                        
+                        yield json.dumps({
+                            "type": "tool_use",
+                            "tool_name": tool_name,
+                            "arguments": format_arguments(step.get("arguments", {})),
+                            "result": format_tool_result(tool_result),
+                            "error_details": step.get("error"),
+                            "is_parallel": False,
+                            "status": "completed" if tool_result is not None else "executing",
+                            "execution_time": step.get("execution_time"),
+                            "timestamp": time.time(),
+                            "result_type": "success" if tool_result is not None and "error" not in str(tool_result).lower() else "error"
+                        }) + "\n"
+                    
+                    elif step["type"] == "final_answer":
+                        if step.get("content"):
+                            final_content = step['content'].strip()
+                            
+                            should_output_final = not is_content_similar(last_thought_content, final_content)
+                            
+                            if should_output_final:
+                                yield json.dumps({
+                                    "type": "final_answer",
+                                    "content": final_content
+                                }) + "\n"
+                    
+                    await asyncio.sleep(0.01)
+                
+                yield json.dumps({"type": "stream_end"}) + "\n"
+                
+            except Exception as e:
+                print(f"[ERROR] Exception in playwright_agent_stream: {e}")
+                import traceback
+                traceback.print_exc()
+                yield json.dumps({
+                    "type": "error",
+                    "error_type": type(e).__name__,
+                    "message": str(e)
+                }) + "\n"
+            finally:
+                # Clean up clients
+                for client in active_clients.values():
+                    try:
+                        if hasattr(client, '__aexit__'):
+                            await client.__aexit__(None, None, None)
+                        elif hasattr(client, 'close'):
+                            await client.close()
+                    except Exception as e:
+                        print(f"Error closing client: {e}")
+
+        return StreamingResponse(playwright_agent_stream(), media_type="application/json")
+        
+    except Exception as e:
+        print(f"[ERROR] Exception in playwright_structured_agent_stream: {e}")
+        import traceback
+        traceback.print_exc()
+        async def error_stream():
+            yield json.dumps({
+                "type": "error",
+                "error_type": type(e).__name__,
+                "message": str(e)
+            }) + "\n"
+        return StreamingResponse(error_stream(), media_type="application/json")
+
+
 
 # --- Main entry point for running the FastAPI app ---
 
