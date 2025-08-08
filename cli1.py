@@ -1288,6 +1288,7 @@ async def llm_structured_agent_stream(req: ChatRequest):
             try:
                 step_count = 0
                 last_thought_content = ""  # Track last thinking content for deduplication
+                accumulated_response = ""  # Track the complete assistant response for saving
                 
                 def clean_content_for_similarity(content):
                     """Clean content for similarity comparison"""
@@ -1335,6 +1336,11 @@ async def llm_structured_agent_stream(req: ChatRequest):
                         
                         if thought_content:
                             last_thought_content = thought_content
+                            
+                            # Add to accumulated response in the same format as your example
+                            thought_section = f"\n## 🤔 Thinking (Step {step_count})\n\n{thought_content}\n\n"
+                            accumulated_response += thought_section
+                            
                             # Emit structured thought block - frontend will render as markdown
                             yield json.dumps({
                                 "type": "thought",
@@ -1398,6 +1404,20 @@ async def llm_structured_agent_stream(req: ChatRequest):
                             execution_time = step.get("execution_time")
                             error_details = step.get("error")
                             
+                            # Format tool execution for accumulated response (matching your example format)
+                            tool_args = format_arguments(step.get("arguments", {}))
+                            formatted_result = format_tool_result(tool_result)
+                            
+                            # Add to accumulated response in the same format as your example
+                            tool_section = f"\n<details>\n<summary>🔧 <strong>Tool: {tool_name}</strong> ✅</summary>\n\n"
+                            
+                            if tool_args:
+                                import json as json_lib
+                                tool_section += f"**Arguments:**\n```json\n{json_lib.dumps(tool_args, indent=2)}\n```\n\n"
+                            
+                            tool_section += f"**Result:**\n```\n{formatted_result}\n```\n\n</details>\n\n"
+                            accumulated_response += tool_section
+                            
                             # Enhanced error logging for debugging
                             if error_details or (tool_result and "error" in str(tool_result).lower()):
                                 print(f"Tool execution error for {tool_name}:")
@@ -1424,6 +1444,11 @@ async def llm_structured_agent_stream(req: ChatRequest):
                         if step.get("content"):
                             final_content = step['content'].strip()
                             
+                            # Accumulate the response content for saving
+                            if not is_content_similar(last_thought_content, final_content):
+                                # Only add if it's not similar to the last thought
+                                accumulated_response += final_content
+                            
                             # Check for similarity with last thought
                             should_output_final = not is_content_similar(last_thought_content, final_content)
                             
@@ -1439,6 +1464,30 @@ async def llm_structured_agent_stream(req: ChatRequest):
                 
                 # Emit completion signal
                 yield json.dumps({"type": "stream_end"}) + "\n"
+                
+                # Save chat history after streaming has ended if chat_id is provided
+                if req.chat_id:
+                    try:
+                        # Get current history and append the new interaction
+                        current_history = get_chat_history(req.chat_id)
+                        
+                        # Add user message
+                        current_history.append({
+                            "role": "user",
+                            "content": req.message
+                        })
+                        
+                        # Add assistant response (collect all final_answer content)
+                        assistant_response = accumulated_response if accumulated_response else "Response completed via streaming"
+                        
+                        current_history.append({
+                            "role": "assistant", 
+                            "content": assistant_response
+                        })
+                        
+                        save_chat_history(req.chat_id, current_history)
+                    except Exception as save_error:
+                        print(f"Error saving chat history: {save_error}")
                 
             except Exception as e:
                 # Emit structured error
@@ -1617,72 +1666,82 @@ async def playwright_structured_agent_stream(req: ChatRequest):
             async def error_stream():
                 yield json.dumps({"type": "error", "data": "No tools available from reachable MCP servers."}) + "\n"
             return StreamingResponse(error_stream(), media_type="application/json")
-        
+    finally:
+        pass    
         # Create tool executor function that routes to appropriate client
-        async def tool_executor(tool_name, tool_args):
-            print(f"[DEBUG] Executing tool: {tool_name} with args: {tool_args}")
-            
-            # Find which client has this tool
-            for server_name, client in active_clients.items():
-                try:
-                    if hasattr(client, 'call_tool'):
-                        # FastMCP client (stdio)
-                        result = await client.call_tool(tool_name, tool_args)
-                        print(f"[DEBUG] Tool '{tool_name}' result from {server_name}: {result}")
-                        return result
+    try:
+        # --- Session-persistent Playwright MCP client ---
+        # Use a global dict to store clients by chat_id
+        import threading
+        from fastmcp.client.transports import StdioTransport
+        from fastmcp.client import Client
+        from langchain_openai import AzureChatOpenAI
+        from langgraph.prebuilt import create_react_agent
+        # Thread-safe client store
+        if not hasattr(playwright_structured_agent_stream, "_client_store"):
+            playwright_structured_agent_stream._client_store = {}
+            playwright_structured_agent_stream._client_lock = threading.Lock()
+        client_store = playwright_structured_agent_stream._client_store
+        client_lock = playwright_structured_agent_stream._client_lock
+
+        # Find Playwright MCP server config
+        playwright_server = None
+        for name, cfg in get_mcp_servers().items():
+            if cfg.get("transport") == "stdio":
+                playwright_server = cfg
+                break
+        if not playwright_server:
+            async def error_stream():
+                yield json.dumps({"type": "error", "data": "No Playwright MCP stdio server configured."}) + "\n"
+            return StreamingResponse(error_stream(), media_type="application/json")
+
+        # Use chat_id for session persistence
+        chat_id = getattr(req, "chat_id", None)
+        client = None
+        # Acquire lock for thread safety
+        with client_lock:
+            if chat_id and chat_id in client_store:
+                client = client_store[chat_id]
+            else:
+                transport = StdioTransport(playwright_server["command"], playwright_server.get("args", []))
+                client = Client(transport)
+                # Enter async context outside lock
+                client_store[chat_id] = client if chat_id else None
+
+        # Enter async context if new client
+        if not hasattr(client, "_entered") or not client._entered:
+            await client.__aenter__()
+            client._entered = True
+
+        try:
+            tools = await client.list_tools()
+            tools = [t.model_dump() if hasattr(t, 'model_dump') else t for t in tools]
+            for tool in tools:
+                if 'parameters' not in tool:
+                    if 'inputSchema' in tool:
+                        tool['parameters'] = tool['inputSchema']
                     else:
-                        # MultiServerMCPClient
-                        # Try to execute tool - it will error if tool not available
-                        tools = await client.get_tools()
-                        tool_names = [t.name for t in tools if hasattr(t, 'name')]
-                        if tool_name in tool_names:
-                            # Execute via LangChain tool
-                            for tool in tools:
-                                if hasattr(tool, 'name') and tool.name == tool_name:
-                                    if hasattr(tool, 'arun'):
-                                        result = await tool.arun(tool_args)
-                                    elif hasattr(tool, 'run'):
-                                        result = await asyncio.to_thread(tool.run, tool_args)
-                                    else:
-                                        result = await tool.ainvoke(tool_args)
-                                    print(f"[DEBUG] Tool '{tool_name}' result from {server_name}: {result}")
-                                    return result
-                except Exception as e:
-                    print(f"[DEBUG] Tool '{tool_name}' not available in {server_name}: {e}")
-                    continue
-            
-            return {"error": f"Tool '{tool_name}' not found in any active server"}
-        
-        # Create StructuredAgent with the combined tools
-        # Convert tool schemas to proper LangChain tools for StructuredAgent
-        import json as json_lib
-        
-        print(f"[DEBUG] Converting {len(all_tools)} tool schemas to LangChain tools")
-        langchain_tools = []
-        for tool_schema in all_tools:
-            tool_name = tool_schema.get('name')
-            tool_description = tool_schema.get('description', '')
-            
-            print(f"[DEBUG] Converting tool: {tool_name}")
-            
-            # Create a closure to capture tool_name for each tool
-            def make_tool_func(captured_tool_name):
-                async def tool_func(**kwargs):
-                    print(f"[DEBUG] Tool {captured_tool_name} called with args: {kwargs}")
-                    return await tool_executor(captured_tool_name, kwargs)
-                return tool_func
-            
-            langchain_tools.append(Tool(
-                name=tool_name,
-                description=tool_description,
-                func=None,
-                coroutine=make_tool_func(tool_name)
-            ))
-        
-        print(f"[DEBUG] Created {len(langchain_tools)} LangChain tools")
-        agent = StructuredAgent(llm, langchain_tools)
-        
-        # --- Prepare messages from history ---
+                        tool['parameters'] = {"type": "object", "properties": {}}
+        except Exception as e:
+            # Clean up client on error
+            with client_lock:
+                if chat_id and chat_id in client_store:
+                    del client_store[chat_id]
+            await client.__aexit__(None, None, None)
+            async def error_stream():
+                yield json.dumps({"type": "error", "data": f"Could not list tools: {e}"}) + "\n"
+            return StreamingResponse(error_stream(), media_type="application/json")
+
+        llm = AzureChatOpenAI(
+            openai_api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+            deployment_name=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),
+            openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
+            openai_api_type="azure",
+        )
+        agent = create_react_agent(llm, tools)
+
+        # Prepare messages from history
         history = req.history
         if req.chat_id:
             history = get_and_update_chat_history(req.chat_id, req.history)
@@ -1696,159 +1755,69 @@ async def playwright_structured_agent_stream(req: ChatRequest):
                     messages.append(AIMessage(content=m["content"]))
         messages.append(HumanMessage(content=req.message))
 
-        # --- Enhanced agent execution with direct tool control ---
-        async def playwright_agent_stream():
+        # Streaming agent-tool loop
+        async def agent_stream():
             try:
                 step_count = 0
-                last_thought_content = ""
-                
-                def clean_content_for_similarity(content):
-                    """Clean content for similarity comparison"""
-                    cleaned = re.sub(r'#+\s*', '', content)
-                    cleaned = re.sub(r'\s+', ' ', cleaned)
-                    return cleaned.lower().strip()
-                
-                def is_content_similar(content1, content2, threshold=0.7):
-                    """Check if two content pieces are similar"""
-                    if not content1 or not content2:
-                        return False
-                    
-                    norm1 = clean_content_for_similarity(content1)
-                    norm2 = clean_content_for_similarity(content2)
-                    
-                    words1 = set(norm1.split())
-                    words2 = set(norm2.split())
-                    
-                    if words1 and words2:
-                        common_words = words1.intersection(words2)
-                        all_words = words1.union(words2)
-                        jaccard_similarity = len(common_words) / len(all_words)
-                        return jaccard_similarity > threshold
-                    
-                    return False
-
-                # Create agent with tool execution override
-                class PlaywrightAgent(StructuredAgent):
-                    def __init__(self, llm, tools, tool_executor_func):
-                        super().__init__(llm, tools)
-                        self.custom_tool_executor = tool_executor_func
-                    
-                    async def _execute_tools(self, tool_calls):
-                        """Override tool execution to use our custom executor"""
-                        tool_messages = []
-                        
-                        for tool_call in tool_calls:
-                            tool_name = tool_call['name']
-                            tool_args = tool_call['args']
-                            
-                            try:
-                                result = await self.custom_tool_executor(tool_name, tool_args)
-                            except Exception as e:
-                                result = f"Error executing {tool_name}: {str(e)}"
-                            
-                            tool_messages.append(
-                                ToolMessage(
-                                    content=str(result),
-                                    tool_call_id=tool_call['id'],
-                                    name=tool_name
-                                )
-                            )
-                        
-                        return tool_messages
-                
-                playwright_agent = PlaywrightAgent(llm, langchain_tools, tool_executor)
-                
-                print(f"[DEBUG] Starting agent stream with {len(langchain_tools)} tools")
-                print(f"[DEBUG] Tool names: {[t.name for t in langchain_tools]}")
-
-                async for step in playwright_agent.astream(messages):
-                    if step["type"] == "thought":
-                        step_count += 1
-                        thought_content = step['content'].strip()
-                        
-                        if thought_content:
-                            last_thought_content = thought_content
-                            yield json.dumps({
-                                "type": "thought",
-                                "content": thought_content,
-                                "step": step_count
-                            }) + "\n"
-                    
-                    elif step["type"] == "tool_execution":
-                        tool_name = step.get('tool_name', 'Unknown Tool')
-                        tool_result = step.get("result")
-                        
-                        def format_tool_result(result):
-                            if result is None:
-                                return None
-                            result_str = str(result)
-                            return result_str
-                        
-                        def format_arguments(args):
-                            if not args:
-                                return {}
-                            if isinstance(args, str):
-                                try:
-                                    return json_lib.loads(args)
-                                except:
-                                    return {"raw": args}
-                            return args
-                        
+                agent_messages = messages.copy()
+                while True:
+                    response = await agent.ainvoke({"messages": agent_messages})
+                    # Find tool calls in the response
+                    tool_calls = []
+                    for msg in response.get('messages', []):
+                        tc = getattr(msg, 'tool_calls', None)
+                        if tc:
+                            tool_calls.extend(tc)
+                    if not tool_calls:
+                        # No tool calls, print final message
+                        for msg in response.get('messages', []):
+                            if hasattr(msg, 'content'):
+                                yield json.dumps({
+                                    "type": "final_answer",
+                                    "content": msg.content
+                                }) + "\n"
+                        break
+                    # Execute each tool and append results as function messages
+                    for tc in tool_calls:
+                        tool_name = tc.get('name')
+                        tool_args = tc.get('args', {})
+                        try:
+                            result = await client.call_tool(tool_name, tool_args)
+                            # Fix: ensure result is JSON serializable
+                            if not isinstance(result, (str, int, float, bool, type(None), dict, list)):
+                                result = str(result)
+                        except Exception as e:
+                            result = {"error": str(e)}
                         yield json.dumps({
                             "type": "tool_use",
                             "tool_name": tool_name,
-                            "arguments": format_arguments(step.get("arguments", {})),
-                            "result": format_tool_result(tool_result),
-                            "error_details": step.get("error"),
-                            "is_parallel": False,
-                            "status": "completed" if tool_result is not None else "executing",
-                            "execution_time": step.get("execution_time"),
-                            "timestamp": time.time(),
-                            "result_type": "success" if tool_result is not None and "error" not in str(tool_result).lower() else "error"
+                            "arguments": tool_args,
+                            "result": result
                         }) + "\n"
-                    
-                    elif step["type"] == "final_answer":
-                        if step.get("content"):
-                            final_content = step['content'].strip()
-                            
-                            should_output_final = not is_content_similar(last_thought_content, final_content)
-                            
-                            if should_output_final:
-                                yield json.dumps({
-                                    "type": "final_answer",
-                                    "content": final_content
-                                }) + "\n"
-                    
+                        # Add the tool result as a function message for next agent step
+                        agent_messages.append({
+                            "role": "function",
+                            "name": tool_name,
+                            "content": str(result)
+                        })
                     await asyncio.sleep(0.01)
-                
                 yield json.dumps({"type": "stream_end"}) + "\n"
-                
             except Exception as e:
-                print(f"[ERROR] Exception in playwright_agent_stream: {e}")
-                import traceback
-                traceback.print_exc()
                 yield json.dumps({
                     "type": "error",
                     "error_type": type(e).__name__,
                     "message": str(e)
                 }) + "\n"
             finally:
-                # Clean up clients
-                for client in active_clients.values():
-                    try:
-                        if hasattr(client, '__aexit__'):
-                            await client.__aexit__(None, None, None)
-                        elif hasattr(client, 'close'):
-                            await client.close()
-                    except Exception as e:
-                        print(f"Error closing client: {e}")
+                # Clean up client if requested (e.g., session end)
+                if chat_id and getattr(req, "end_session", False):
+                    with client_lock:
+                        if chat_id in client_store:
+                            del client_store[chat_id]
+                    await client.__aexit__(None, None, None)
 
-        return StreamingResponse(playwright_agent_stream(), media_type="application/json")
-        
+        return StreamingResponse(agent_stream(), media_type="application/json")
     except Exception as e:
-        print(f"[ERROR] Exception in playwright_structured_agent_stream: {e}")
-        import traceback
-        traceback.print_exc()
         async def error_stream():
             yield json.dumps({
                 "type": "error",
@@ -1856,8 +1825,6 @@ async def playwright_structured_agent_stream(req: ChatRequest):
                 "message": str(e)
             }) + "\n"
         return StreamingResponse(error_stream(), media_type="application/json")
-
-
 
 # --- Main entry point for running the FastAPI app ---
 
