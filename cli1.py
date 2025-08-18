@@ -283,7 +283,7 @@ async def get_resource_content(server: str, uri: str):
                 entry["type"] = "unknown"
                 entry["content"] = None
             result.append(entry)
-        return result
+        return result[0].get("content")
 
 @app.get("/mcp/list-prompts")
 async def list_mcp_prompts(server: str):

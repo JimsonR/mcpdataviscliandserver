@@ -1462,6 +1462,7 @@ class PrepareTableResourceArgs(BaseModel):
     n: int = 5
     title: str = None
 
+
 @mcp.tool()
 def prepare_table_resource(args: PrepareTableResourceArgs) -> list:
     """Prepare a DataFrame preview for the frontend resource in CSV format. Does NOT return the table to the LLM."""
@@ -1478,7 +1479,68 @@ def prepare_table_resource(args: PrepareTableResourceArgs) -> list:
         "title": title,
         "csv": csv_data
     }
-    return [TextContent(type="text", text=f"Table preview for '{df_name}' ({n} rows, CSV format) prepared. Fetch via resource.")]
+    # Return a link to the resource endpoint for preview
+    return [TextContent(type="text", text=f"Table preview for '{df_name}' ({n} rows, CSV format) prepared. View or download at: /resource/data-exploration://table-preview")]
+
+# --- Export full DataFrame as CSV ---
+
+class ExportTableCsvArgs(BaseModel):
+    df_name: str
+    filename: str = None  # Optional custom filename
+
+
+@mcp.tool()
+def export_table_csv(args: ExportTableCsvArgs) -> list:
+    from dotenv import load_dotenv
+    import os
+    load_dotenv()
+    print(os.environ.get("AWS_ACCESS_KEY_ID"))
+    """Export the full DataFrame as a downloadable CSV file to AWS S3 with a 1-hour expiry link."""
+    import os
+    import boto3
+    from botocore.exceptions import BotoCoreError, NoCredentialsError
+    global _dataframes
+    df_name = args.df_name
+    filename = args.filename
+    bucket_name = "s3-practice-ss"
+    if df_name not in _dataframes:
+        return [TextContent(type="text", text=f"DataFrame '{df_name}' not found. Available: {list(_dataframes.keys())}")]
+    df = _dataframes[df_name]
+    row_count = len(df)
+    # Default filename
+    if not filename:
+        filename = f"{df_name}_export_{row_count}_rows.csv"
+    # Save to a temp file
+    temp_dir = os.path.join(os.getcwd(), "temp_exports")
+    os.makedirs(temp_dir, exist_ok=True)
+    file_path = os.path.join(temp_dir, filename)
+    warning = ""
+    if row_count > 100000:
+        warning = f"Warning: Table has {row_count} rows. Download may take time.\n"
+    try:
+        df.to_csv(file_path, index=False)
+        # Upload to S3
+        
+        region = os.getenv("AWS_REGION", "ap-south-1")
+        s3 = boto3.client("s3", region_name=region)
+        s3.upload_file(file_path, bucket_name, filename)
+        # Generate presigned URL (expires in 1 hour)
+        presigned_url = s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": bucket_name, "Key": filename},
+            ExpiresIn=3600
+        )
+        # Delete local temp file after upload
+        try:
+            os.remove(file_path)
+        except Exception:
+            pass
+        msg = f"{warning}Full table exported to S3. Download link (valid for 1 hour):\n{presigned_url}"
+        return [TextContent(type="text", text=msg)]
+    except (BotoCoreError, NoCredentialsError) as e:
+        return [TextContent(type="text", text=f"AWS S3 error: {str(e)}")]
+    except Exception as e:
+        return [TextContent(type="text", text=f"Error exporting table: {str(e)}")]
 
 @mcp.resource("data-exploration://table-preview", mime_type="application/json")
 def table_preview_resource():
