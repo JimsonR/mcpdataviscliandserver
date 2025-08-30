@@ -22,17 +22,15 @@ RUN apt-get update && \
 
 RUN apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# ...existing code...
-
 # Set working directory
 WORKDIR /app
 
 # Copy requirements file and source code
-COPY requirements.txt ./
+COPY azdbexp-requirements.txt ./
 COPY azdbexp.py ./
 
 # Install dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r azdbexp-requirements.txt
 
 EXPOSE 8005
 CMD ["python", "azdbexp.py"]
