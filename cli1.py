@@ -1225,7 +1225,7 @@ def delete_mcp_server(name: str):
 
 
 # --- New endpoint: Streaming StructuredAgent with formatted output ---
-@app.post("/llm/structured-agent-stream")
+# @app.post("/llm/structured-agent-stream")
 async def llm_structured_agent_stream(req: ChatRequest):
     """
     Streaming endpoint for StructuredAgent responses. Streams reasoning, tool actions, and tool outputs 
@@ -1582,12 +1582,110 @@ LLM_MAX_TOKENS = {
     # Add more as needed
 }
 
-# --- Playwright-compatible streaming endpoint ---
-@app.post("/llm/playwright-structured-agent-stream")
-async def playwright_structured_agent_stream(req: ChatRequest):
+# Global client store and cleanup management
+import threading
+import time
+import asyncio
+from fastmcp.client.transports import StdioTransport
+from fastmcp.client import Client
+
+# Thread-safe client store for session persistence
+_global_client_store = {}
+_global_client_lock = threading.Lock()
+_last_cleanup_time = 0
+_cleanup_interval = 300  # 5 minutes
+
+async def cleanup_stale_clients():
+    """Clean up stale stdio clients to prevent process accumulation."""
+    global _last_cleanup_time
+    current_time = time.time()
+    
+    if current_time - _last_cleanup_time < _cleanup_interval:
+        return
+    
+    print("[DEBUG] Running cleanup of stale stdio clients...")
+    _last_cleanup_time = current_time
+    
+    with _global_client_lock:
+        sessions_to_remove = []
+        for session_key, session_clients in _global_client_store.items():
+            clients_to_remove = []
+            for server_name, client in session_clients.items():
+                try:
+                    # Test if client is still responsive
+                    if hasattr(client, 'transport') and client.transport:
+                        # Quick health check
+                        await asyncio.wait_for(client.list_tools(), timeout=1.0)
+                    else:
+                        clients_to_remove.append(server_name)
+                except Exception:
+                    print(f"[DEBUG] Cleaning up stale client {session_key}/{server_name}")
+                    clients_to_remove.append(server_name)
+                    try:
+                        if hasattr(client, '__aexit__'):
+                            await client.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+            
+            # Remove stale clients
+            for server_name in clients_to_remove:
+                del session_clients[server_name]
+            
+            # Remove empty sessions
+            if not session_clients:
+                sessions_to_remove.append(session_key)
+        
+        # Remove empty sessions
+        for session_key in sessions_to_remove:
+            del _global_client_store[session_key]
+    
+    print(f"[DEBUG] Cleanup complete. Active sessions: {len(_global_client_store)}")
+
+def get_active_process_count():
+    """Get count of active stdio processes for monitoring."""
+    count = 0
+    with _global_client_lock:
+        for session_clients in _global_client_store.values():
+            count += len(session_clients)
+    return count
+
+# --- Process monitoring endpoint ---
+@app.get("/mcp/process-status")
+async def get_process_status():
+    """Get status of active MCP stdio processes for monitoring."""
+    process_count = get_active_process_count()
+    
+    # Get detailed session info
+    sessions_info = {}
+    with _global_client_lock:
+        for session_key, session_clients in _global_client_store.items():
+            sessions_info[session_key] = {
+                "client_count": len(session_clients),
+                "servers": list(session_clients.keys())
+            }
+    
+    return {
+        "active_stdio_processes": process_count,
+        "active_sessions": len(_global_client_store),
+        "sessions": sessions_info,
+        "cleanup_interval_seconds": _cleanup_interval
+    }
+
+@app.post("/mcp/cleanup-processes")
+async def manual_cleanup():
+    """Manually trigger cleanup of stale stdio processes."""
+    global _last_cleanup_time
+    _last_cleanup_time = 0  # Force cleanup
+    await cleanup_stale_clients()
+    return {"message": "Cleanup completed", "active_processes": get_active_process_count()}
+
+# --- Multi-server streaming endpoint ---
+# @app.post("/llm/playwright-structured-agent-stream")
+@app.post("/llm/structured-agent-stream")
+async def multi_server_structured_agent_stream(req: ChatRequest):
     """
-    Streaming endpoint optimized for Playwright and stdio-based MCP servers.
-    Uses individual client connections instead of MultiServerMCPClient for better compatibility.
+    Streaming endpoint supporting multiple MCP servers (stdio and HTTP).
+    Uses session-persistent clients for better state management.
     """
     servers = get_mcp_servers()
     if not servers:
@@ -1595,33 +1693,85 @@ async def playwright_structured_agent_stream(req: ChatRequest):
             yield json.dumps({"type": "error", "data": "No MCP servers configured."}) + "\n"
         return StreamingResponse(error_stream(), media_type="application/json")
     
+    # Run periodic cleanup to prevent process accumulation
+    await cleanup_stale_clients()
+    
+    # Monitor process count
+    process_count = get_active_process_count()
+    print(f"[DEBUG] Active stdio processes before request: {process_count}")
+    
+    # Session-persistent client management using global store
+    chat_id = getattr(req, "chat_id", None) or "default_session"
+    
     try:
         # Filter for reachable servers but handle stdio servers specially
         reachable_servers = await get_reachable_servers(servers, skip_health_check=True)
         if not reachable_servers:
             async def error_stream():
-                yield json.dumps({"type": "error", "data": "No MCP servers configured."}) + "\n"
+                yield json.dumps({"type": "error", "data": "No reachable MCP servers found."}) + "\n"
             return StreamingResponse(error_stream(), media_type="application/json")
         
         print(f"Using {len(reachable_servers)} servers: {list(reachable_servers.keys())}")
         
-        # Create individual clients for each server (better for stdio servers like Playwright)
+        # Create or reuse clients for each server type
         all_tools = []
         active_clients = {}
+        server_tool_mapping = {}  # Maps tool names to server names
+        
+        # Handle session-persistent clients using global store
+        with _global_client_lock:
+            session_key = f"session_{chat_id}"
+            if session_key not in _global_client_store:
+                _global_client_store[session_key] = {}
+            session_clients = _global_client_store[session_key]
         
         for server_name, server_config in reachable_servers.items():
             try:
                 if server_config.get("transport") == "stdio":
-                    # Handle stdio servers directly
-                    from fastmcp.client.transports import StdioTransport
-                    from fastmcp.client import Client
+                    # Handle stdio servers with session persistence and proper cleanup
+                    client = None
+                    client_needs_setup = True
                     
-                    transport = StdioTransport(
-                        server_config["command"], 
-                        server_config.get("args", [])
-                    )
-                    client = Client(transport)
-                    await client.__aenter__()
+                    if server_name in session_clients:
+                        existing_client = session_clients[server_name]
+                        # Check if existing client is still valid
+                        try:
+                            if (hasattr(existing_client, '_entered') and existing_client._entered and 
+                                hasattr(existing_client, 'transport') and 
+                                existing_client.transport and 
+                                not getattr(existing_client.transport, '_closed', False)):
+                                
+                                # Test if client is responsive
+                                await asyncio.wait_for(existing_client.list_tools(), timeout=2.0)
+                                client = existing_client
+                                client_needs_setup = False
+                                print(f"[DEBUG] Reusing existing stdio client for {server_name}")
+                            else:
+                                print(f"[DEBUG] Existing stdio client for {server_name} is not valid, creating new one")
+                        except Exception as e:
+                            print(f"[DEBUG] Existing stdio client for {server_name} failed health check: {e}, creating new one")
+                            # Clean up the invalid client
+                            try:
+                                if hasattr(existing_client, '__aexit__'):
+                                    await existing_client.__aexit__(None, None, None)
+                            except Exception:
+                                pass
+                            with _global_client_lock:
+                                if server_name in session_clients:
+                                    del session_clients[server_name]
+                    
+                    if client_needs_setup:
+                        print(f"[DEBUG] Creating new stdio client for {server_name}")
+                        transport = StdioTransport(
+                            server_config["command"], 
+                            server_config.get("args", [])
+                        )
+                        client = Client(transport)
+                        await client.__aenter__()
+                        client._entered = True
+                        with _global_client_lock:
+                            session_clients[server_name] = client
+                    
                     active_clients[server_name] = client
                     
                     # Get tools from this client
@@ -1629,30 +1779,90 @@ async def playwright_structured_agent_stream(req: ChatRequest):
                         tools = await client.list_tools()
                         tools = [t.model_dump() if hasattr(t, 'model_dump') else t for t in tools]
                         
-                        # Ensure proper tool schema format
+                        # Ensure proper tool schema format and map tools to servers
                         for tool in tools:
                             if 'parameters' not in tool:
                                 if 'inputSchema' in tool:
                                     tool['parameters'] = tool['inputSchema']
                                 else:
                                     tool['parameters'] = {"type": "object", "properties": {}}
+                            
+                            # Map tool name to server for routing
+                            tool_name = tool.get('name')
+                            if tool_name:
+                                server_tool_mapping[tool_name] = server_name
                         
                         print(f"[DEBUG] Tools loaded from {server_name}: {[t['name'] for t in tools]}")
                         all_tools.extend(tools)
                         
                     except Exception as e:
                         print(f"Error getting tools from {server_name}: {e}")
+                        # Clean up client on error
+                        try:
+                            if hasattr(client, '__aexit__'):
+                                await client.__aexit__(None, None, None)
+                        except Exception:
+                            pass
+                        with _global_client_lock:
+                            if server_name in session_clients:
+                                del session_clients[server_name]
                         continue
                         
-                else:
-                    # Handle URL-based servers with MultiServerMCPClient
-                    single_server = {server_name: server_config}
-                    client = MultiServerMCPClient(single_server)
+                elif server_config.get("transport") in ["streamable_http", "http"]:
+                    # Handle HTTP servers with MultiServerMCPClient
+                    if server_name in session_clients:
+                        client = session_clients[server_name]
+                    else:
+                        single_server = {server_name: server_config}
+                        client = MultiServerMCPClient(single_server)
+                        with _global_client_lock:
+                            session_clients[server_name] = client
+                    
                     active_clients[server_name] = client
                     
                     try:
                         tools = await client.get_tools()
-                        all_tools.extend(tools)
+                        # Convert LangChain tools to our format with proper schema handling
+                        for tool in tools:
+                            # Extract proper parameters schema
+                            parameters = {"type": "object", "properties": {}}
+                            
+                            if hasattr(tool, 'args_schema') and tool.args_schema:
+                                try:
+                                    # Get the schema from Pydantic model
+                                    if hasattr(tool.args_schema, 'model_json_schema'):
+                                        schema = tool.args_schema.model_json_schema()
+                                        parameters = schema
+                                    elif hasattr(tool.args_schema, 'schema'):
+                                        schema = tool.args_schema.schema()
+                                        parameters = schema
+                                    elif hasattr(tool.args_schema, '__annotations__'):
+                                        # Fallback: build schema from annotations
+                                        properties = {}
+                                        for field_name, field_type in tool.args_schema.__annotations__.items():
+                                            if field_type == str:
+                                                properties[field_name] = {"type": "string"}
+                                            elif field_type == int:
+                                                properties[field_name] = {"type": "integer"}
+                                            elif field_type == float:
+                                                properties[field_name] = {"type": "number"}
+                                            elif field_type == bool:
+                                                properties[field_name] = {"type": "boolean"}
+                                            else:
+                                                properties[field_name] = {"type": "string"}
+                                        parameters = {"type": "object", "properties": properties}
+                                except Exception as e:
+                                    print(f"Error extracting schema for tool {tool.name}: {e}")
+                                    parameters = {"type": "object", "properties": {}}
+                            
+                            tool_dict = {
+                                'name': tool.name,
+                                'description': tool.description,
+                                'parameters': parameters
+                            }
+                            server_tool_mapping[tool.name] = server_name
+                            all_tools.append(tool_dict)
+                        
                         print(f"[DEBUG] Tools loaded from {server_name}: {[t.name for t in tools if hasattr(t, 'name')]}")
                     except Exception as e:
                         print(f"Error getting tools from {server_name}: {e}")
@@ -1666,72 +1876,35 @@ async def playwright_structured_agent_stream(req: ChatRequest):
             async def error_stream():
                 yield json.dumps({"type": "error", "data": "No tools available from reachable MCP servers."}) + "\n"
             return StreamingResponse(error_stream(), media_type="application/json")
-    finally:
-        pass    
-        # Create tool executor function that routes to appropriate client
-    try:
-        # --- Session-persistent Playwright MCP client ---
-        # Use a global dict to store clients by chat_id
-        import threading
-        from fastmcp.client.transports import StdioTransport
-        from fastmcp.client import Client
-        from langchain_openai import AzureChatOpenAI
-        from langgraph.prebuilt import create_react_agent
-        # Thread-safe client store
-        if not hasattr(playwright_structured_agent_stream, "_client_store"):
-            playwright_structured_agent_stream._client_store = {}
-            playwright_structured_agent_stream._client_lock = threading.Lock()
-        client_store = playwright_structured_agent_stream._client_store
-        client_lock = playwright_structured_agent_stream._client_lock
-
-        # Find Playwright MCP server config
-        playwright_server = None
-        for name, cfg in get_mcp_servers().items():
-            if cfg.get("transport") == "stdio":
-                playwright_server = cfg
-                break
-        if not playwright_server:
-            async def error_stream():
-                yield json.dumps({"type": "error", "data": "No Playwright MCP stdio server configured."}) + "\n"
-            return StreamingResponse(error_stream(), media_type="application/json")
-
-        # Use chat_id for session persistence
-        chat_id = getattr(req, "chat_id", None)
-        client = None
-        # Acquire lock for thread safety
-        with client_lock:
-            if chat_id and chat_id in client_store:
-                client = client_store[chat_id]
-            else:
-                transport = StdioTransport(playwright_server["command"], playwright_server.get("args", []))
-                client = Client(transport)
-                # Enter async context outside lock
-                client_store[chat_id] = client if chat_id else None
-
-        # Enter async context if new client
-        if not hasattr(client, "_entered") or not client._entered:
-            await client.__aenter__()
-            client._entered = True
-
-        try:
-            tools = await client.list_tools()
-            tools = [t.model_dump() if hasattr(t, 'model_dump') else t for t in tools]
-            for tool in tools:
+        
+        # Validate all tool schemas before proceeding
+        validated_tools = []
+        for tool in all_tools:
+            try:
+                # Ensure each tool has proper schema
                 if 'parameters' not in tool:
-                    if 'inputSchema' in tool:
-                        tool['parameters'] = tool['inputSchema']
-                    else:
-                        tool['parameters'] = {"type": "object", "properties": {}}
-        except Exception as e:
-            # Clean up client on error
-            with client_lock:
-                if chat_id and chat_id in client_store:
-                    del client_store[chat_id]
-            await client.__aexit__(None, None, None)
-            async def error_stream():
-                yield json.dumps({"type": "error", "data": f"Could not list tools: {e}"}) + "\n"
-            return StreamingResponse(error_stream(), media_type="application/json")
+                    tool['parameters'] = {"type": "object", "properties": {}}
+                elif not isinstance(tool['parameters'], dict):
+                    tool['parameters'] = {"type": "object", "properties": {}}
+                elif 'type' not in tool['parameters']:
+                    tool['parameters']['type'] = "object"
+                elif tool['parameters'].get('type') in [None, "None"]:
+                    tool['parameters']['type'] = "object"
+                
+                # Ensure properties exist
+                if 'properties' not in tool['parameters']:
+                    tool['parameters']['properties'] = {}
+                
+                validated_tools.append(tool)
+                print(f"[DEBUG] Validated tool {tool.get('name')}: {tool.get('parameters', {}).get('type')}")
+            except Exception as e:
+                print(f"[WARNING] Skipping invalid tool {tool.get('name', 'unknown')}: {e}")
+                continue
+        
+        all_tools = validated_tools
+        print(f"[DEBUG] Total validated tools: {len(all_tools)}")
 
+        # Create the LLM and agent
         llm = AzureChatOpenAI(
             openai_api_key=os.getenv("AZURE_OPENAI_API_KEY"),
             azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
@@ -1739,7 +1912,7 @@ async def playwright_structured_agent_stream(req: ChatRequest):
             openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
             openai_api_type="azure",
         )
-        agent = create_react_agent(llm, tools)
+        agent = create_react_agent(llm, all_tools)
 
         # Prepare messages from history
         history = req.history
@@ -1755,11 +1928,70 @@ async def playwright_structured_agent_stream(req: ChatRequest):
                     messages.append(AIMessage(content=m["content"]))
         messages.append(HumanMessage(content=req.message))
 
-        # Streaming agent-tool loop
+        # Enhanced tool execution function that routes to appropriate server
+        async def execute_tool(tool_name: str, tool_args: dict):
+            """Execute tool by routing to the appropriate server based on tool mapping."""
+            server_name = server_tool_mapping.get(tool_name)
+            if not server_name:
+                return {"error": f"Unknown tool: {tool_name}"}
+            
+            client = active_clients.get(server_name)
+            if not client:
+                return {"error": f"No active client for server: {server_name}"}
+            
+            try:
+                # Handle different client types
+                if hasattr(client, 'call_tool'):
+                    # FastMCP client (stdio)
+                    result = await client.call_tool(tool_name, tool_args)
+                elif hasattr(client, 'get_tools'):
+                    # MultiServerMCPClient (HTTP)
+                    tools = await client.get_tools()
+                    tool_obj = next((t for t in tools if t.name == tool_name), None)
+                    if tool_obj:
+                        result = await tool_obj.ainvoke(tool_args)
+                    else:
+                        result = {"error": f"Tool {tool_name} not found in server {server_name}"}
+                else:
+                    result = {"error": f"Unknown client type for server: {server_name}"}
+                
+                # Ensure result is JSON serializable
+                if not isinstance(result, (str, int, float, bool, type(None), dict, list)):
+                    result = str(result)
+                return result
+                
+            except Exception as e:
+                return {"error": f"Tool execution failed: {str(e)}"}
+
+        # Streaming agent-tool loop with structured response format
         async def agent_stream():
             try:
                 step_count = 0
                 agent_messages = messages.copy()
+                accumulated_response = ""  # Track the complete assistant response for saving
+                
+                def format_tool_result(result):
+                    """Format tool result for better display"""
+                    if result is None:
+                        return None
+                    
+                    result_str = str(result)
+                    return result_str
+                
+                def format_arguments(args):
+                    """Format arguments for better display"""
+                    if not args:
+                        return {}
+                    
+                    # If args is a string, try to parse as JSON for better formatting
+                    if isinstance(args, str):
+                        try:
+                            import json as json_lib
+                            return json_lib.loads(args)
+                        except:
+                            return {"raw": args}
+                    return args
+                
                 while True:
                     response = await agent.ainvoke({"messages": agent_messages})
                     # Find tool calls in the response
@@ -1768,32 +2000,72 @@ async def playwright_structured_agent_stream(req: ChatRequest):
                         tc = getattr(msg, 'tool_calls', None)
                         if tc:
                             tool_calls.extend(tc)
+                    
                     if not tool_calls:
-                        # No tool calls, print final message
+                        # No tool calls, emit final answer
                         for msg in response.get('messages', []):
-                            if hasattr(msg, 'content'):
+                            if hasattr(msg, 'content') and msg.content:
+                                final_content = msg.content.strip()
+                                accumulated_response += final_content
+                                
+                                # Emit structured final answer - matching llm_structured_agent_stream format
                                 yield json.dumps({
                                     "type": "final_answer",
-                                    "content": msg.content
+                                    "content": final_content
                                 }) + "\n"
                         break
+                    
                     # Execute each tool and append results as function messages
                     for tc in tool_calls:
                         tool_name = tc.get('name')
                         tool_args = tc.get('args', {})
-                        try:
-                            result = await client.call_tool(tool_name, tool_args)
-                            # Fix: ensure result is JSON serializable
-                            if not isinstance(result, (str, int, float, bool, type(None), dict, list)):
-                                result = str(result)
-                        except Exception as e:
-                            result = {"error": str(e)}
+                        
+                        # Emit tool execution start - matching llm_structured_agent_stream format
                         yield json.dumps({
                             "type": "tool_use",
                             "tool_name": tool_name,
-                            "arguments": tool_args,
-                            "result": result
+                            "server": server_tool_mapping.get(tool_name, "unknown"),
+                            "arguments": format_arguments(tool_args),
+                            "result": None,
+                            "is_parallel": False,
+                            "status": "executing",
+                            "timestamp": time.time()
                         }) + "\n"
+                        
+                        # Use enhanced tool execution with routing
+                        execution_start = time.time()
+                        result = await execute_tool(tool_name, tool_args)
+                        execution_time = time.time() - execution_start
+                        
+                        # Determine if result is an error
+                        is_error = isinstance(result, dict) and "error" in result
+                        
+                        # Add to accumulated response in the same format as llm_structured_agent_stream
+                        formatted_result = format_tool_result(result)
+                        tool_section = f"\n<details>\n<summary>🔧 <strong>Tool: {tool_name}</strong> {'❌' if is_error else '✅'}</summary>\n\n"
+                        
+                        if tool_args:
+                            import json as json_lib
+                            tool_section += f"**Arguments:**\n```json\n{json_lib.dumps(format_arguments(tool_args), indent=2)}\n```\n\n"
+                        
+                        tool_section += f"**Result:**\n```\n{formatted_result}\n```\n\n</details>\n\n"
+                        accumulated_response += tool_section
+                        
+                        # Emit tool execution completion - matching llm_structured_agent_stream format
+                        yield json.dumps({
+                            "type": "tool_use",
+                            "tool_name": tool_name,
+                            "server": server_tool_mapping.get(tool_name, "unknown"),
+                            "arguments": format_arguments(tool_args),
+                            "result": format_tool_result(result),
+                            "error_details": result.get("error") if is_error else None,
+                            "is_parallel": False,
+                            "status": "completed",
+                            "execution_time": execution_time,
+                            "timestamp": time.time(),
+                            "result_type": "error" if is_error else "success"
+                        }) + "\n"
+                        
                         # Add the tool result as a function message for next agent step
                         agent_messages.append({
                             "role": "function",
@@ -1801,23 +2073,76 @@ async def playwright_structured_agent_stream(req: ChatRequest):
                             "content": str(result)
                         })
                     await asyncio.sleep(0.01)
+                
+                # Emit completion signal - matching llm_structured_agent_stream format
                 yield json.dumps({"type": "stream_end"}) + "\n"
+                
+                # Save chat history after streaming has ended if chat_id is provided
+                if req.chat_id:
+                    try:
+                        # Get current history and append the new interaction
+                        current_history = get_chat_history(req.chat_id)
+                        
+                        # Add user message
+                        current_history.append({
+                            "role": "user",
+                            "content": req.message
+                        })
+                        
+                        # Add assistant response
+                        assistant_response = accumulated_response if accumulated_response else "Response completed via streaming"
+                        
+                        current_history.append({
+                            "role": "assistant", 
+                            "content": assistant_response
+                        })
+                        
+                        save_chat_history(req.chat_id, current_history)
+                    except Exception as save_error:
+                        print(f"Error saving chat history: {save_error}")
+                        
             except Exception as e:
+                # Emit structured error - matching llm_structured_agent_stream format
                 yield json.dumps({
                     "type": "error",
                     "error_type": type(e).__name__,
                     "message": str(e)
                 }) + "\n"
             finally:
-                # Clean up client if requested (e.g., session end)
+                # Clean up session if requested
                 if chat_id and getattr(req, "end_session", False):
-                    with client_lock:
-                        if chat_id in client_store:
-                            del client_store[chat_id]
-                    await client.__aexit__(None, None, None)
+                    with _global_client_lock:
+                        session_key = f"session_{chat_id}"
+                        if session_key in _global_client_store:
+                            session_clients = _global_client_store[session_key]
+                            # Clean up all clients in this session
+                            for server_name, client in session_clients.items():
+                                try:
+                                    if hasattr(client, '__aexit__'):
+                                        await client.__aexit__(None, None, None)
+                                except Exception as e:
+                                    print(f"Error cleaning up client for {server_name}: {e}")
+                            del _global_client_store[session_key]
 
         return StreamingResponse(agent_stream(), media_type="application/json")
+    
     except Exception as e:
+        # Clean up any partially created clients on error
+        try:
+            with _global_client_lock:
+                session_key = f"session_{chat_id}"
+                if session_key in _global_client_store:
+                    session_clients = _global_client_store[session_key]
+                    for server_name, client in session_clients.items():
+                        try:
+                            if hasattr(client, '__aexit__'):
+                                await client.__aexit__(None, None, None)
+                        except Exception:
+                            pass
+                    del _global_client_store[session_key]
+        except Exception:
+            pass
+            
         async def error_stream():
             yield json.dumps({
                 "type": "error",
